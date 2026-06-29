@@ -9,11 +9,12 @@ import json
 import os
 import sys
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(PROJECT_ROOT))
 
-from models.unet1d import UNet1D, DiceBCELoss, column_accuracy, interval_iou, roi_interval_iou, split_interval_iou
-from data.dataset import CharSegmentDataset, collate_fn, load_all_line_ids
-from train_config import TrainConfig
+from ai_model.models.unet1d import UNet1D, DiceBCELoss, column_accuracy, interval_iou, roi_interval_iou, split_interval_iou
+from ai_model.data.dataset import CharSegmentDataset, collate_fn, load_all_line_ids
+from ai_model.train.train_config import TrainConfig
 
 try:
     from tqdm import tqdm

@@ -5,10 +5,11 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import sys
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(PROJECT_ROOT))
 
-from inference.infer import CharSegmentPredictor
-from data.dataset import load_all_line_ids
+from ai_model.inference.infer import CharSegmentPredictor
+from ai_model.data.dataset import load_all_line_ids
 
 
 class ActiveLearner:
