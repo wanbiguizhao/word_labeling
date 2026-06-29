@@ -147,8 +147,12 @@ def train_split_dataset(train_ratio, seed, sort_by_width, data_base_path, output
               help="模型权重路径（默认: models/char_segment_1d_unet_best.pth）")
 @click.option("--data-base-path", type=click.Path(exists=True), default=None,
               help="数据基础目录（默认: <项目根>/datahome）")
-def train_active_learn(top_n, model_path, data_base_path):
-    """主动学习：找出最需要标注的行"""
+@click.option("--batch-size", type=int, default=32, show_default=True,
+              help="GPU批量推理批大小")
+@click.option("--num-workers", type=int, default=4, show_default=True,
+              help="并行特征提取和评分的线程数")
+def train_active_learn(top_n, model_path, data_base_path, batch_size, num_workers):
+    """主动学习：找出最需要标注的行（使用GPU批量并行推理加速）"""
     from ai_model.train.active_learning import ActiveLearner
 
     data_path = Path(data_base_path) if data_base_path else BASE_DIR / "datahome"
@@ -165,8 +169,8 @@ def train_active_learn(top_n, model_path, data_base_path):
 
     click.echo(f"[INFO] 加载模型: {model_file}")
     learner = ActiveLearner(model_file, data_path)
-    click.echo(f"[INFO] 开始计算主动学习分数...")
-    ranked_lines = learner.rank_lines(top_n)
+    click.echo(f"[INFO] 开始计算主动学习分数（batch_size={batch_size}, num_workers={num_workers}）...")
+    ranked_lines = learner.rank_lines_batched(top_n, batch_size=batch_size, num_workers=num_workers)
 
     click.echo(f"\n[INFO] Top {len(ranked_lines)} 需要优先标注的行：")
     click.echo("-" * 120)
