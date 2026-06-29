@@ -279,118 +279,147 @@ class ActiveLearner:
         }
     
     def rank_lines_batched(self, top_n: int = 100, batch_size: int = 32, 
-                           num_workers: int = 4) -> List[Dict]:
+                           num_workers: int = 4, chunk_size: int = 1000) -> List[Dict]:
         """
-        批量并行推理版本：对所有行数据进行主动学习排序
+        微批量并行推理版本：对所有行数据进行主动学习排序
         
         加速策略：
-        1. 使用 ThreadPoolExecutor 并行提取特征（CPU密集）
-        2. 使用 GPU 批量推理（GPU密集，主要加速点）
-        3. 使用 ThreadPoolExecutor 并行计算 AL 分数（CPU密集）
+        1. 将数据分成多个chunk（默认1000个/批），逐个chunk处理
+        2. 每个chunk内部：使用ThreadPoolExecutor并行提取特征（CPU密集）
+        3. GPU批量推理（GPU密集，主要加速点）
+        4. ThreadPoolExecutor并行计算AL分数（CPU密集）
+        5. 每处理完一个chunk立即更新全局Top N排名，快速看到结果
         
         Args:
             top_n: 返回前N个最需要标注的行
             batch_size: GPU推理批大小
-            num_workers: 并行特征提取的线程数
+            num_workers: 并行特征提取和评分的线程数
+            chunk_size: 微批量大小，每处理完一个chunk更新一次排名
         
         Returns:
             按AL分数从高到低排序的行列表
         """
+        import torch
+        
         line_ids = load_all_line_ids(self.data_base_path)
         total_lines = len(line_ids)
         print(f"[INFO] 总共有 {total_lines} 个行数据")
         
-        # Step 1: 并行提取所有行的特征
-        print(f"[INFO] 并行提取特征（{num_workers} 线程）...")
-        line_data_list = []
+        # 按chunk_size分块
+        chunks = [line_ids[i:i+chunk_size] for i in range(0, total_lines, chunk_size)]
+        num_chunks = len(chunks)
+        print(f"[INFO] 分成 {num_chunks} 个chunk，每chunk {chunk_size} 个")
         
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(self._extract_features_for_line, line_id): line_id 
-                      for line_id in line_ids}
-            
-            for future in tqdm(as_completed(futures), total=len(futures), desc="特征提取"):
-                result = future.result()
-                if result is not None:
-                    line_data_list.append(result)
-        
-        if not line_data_list:
-            print("[WARN] 没有有效的行数据")
-            return []
-        
-        print(f"[INFO] 成功提取 {len(line_data_list)} 行特征")
-        
-        # Step 2: GPU批量推理
-        print(f"[INFO] GPU批量推理（batch_size={batch_size}）...")
         device = self.predictor.device
         model = self.predictor.model
         threshold = self.predictor.threshold
         max_gap = self.predictor.max_gap
         
-        pred_results = []
-        num_batches = (len(line_data_list) + batch_size - 1) // batch_size
+        global_top_scores = []
         
-        with torch.no_grad():
-            for batch_idx in tqdm(range(num_batches), desc="批量推理"):
-                start = batch_idx * batch_size
-                end = min(start + batch_size, len(line_data_list))
-                batch_data = line_data_list[start:end]
-                
-                if not batch_data:
-                    continue
-                
-                # 找到最大宽度，统一padding
-                max_width = max(item['resized_w'] for item in batch_data)
-                n_channels = batch_data[0]['features'].shape[1]
-                
-                # 构建batch tensor
-                batch_features = np.zeros((len(batch_data), n_channels, max_width), dtype=np.float32)
-                for i, item in enumerate(batch_data):
-                    w = item['resized_w']
-                    batch_features[i, :, :w] = item['features'].transpose(1, 0)
-                
-                # GPU推理
-                features_tensor = torch.from_numpy(batch_features).to(device)
-                output = model(features_tensor)
-                pred_probs = torch.sigmoid(output).cpu().numpy()
-                
-                # 后处理每个样本
-                for i, item in enumerate(batch_data):
-                    w = item['resized_w']
-                    pred_prob = pred_probs[i, 0, :w]
-                    
-                    # 提取区间
-                    intervals = IntervalExtractor.extract(pred_prob, threshold, max_gap)
-                    
-                    # 映射回原始坐标
-                    inv_scale = 1.0 / item['scale'] if item['scale'] > 0 else 1.0
-                    intervals_orig = [
-                        (int(round(start * inv_scale)), int(round(end * inv_scale)))
-                        for start, end in intervals
-                    ]
-                    
-                    pred_results.append({
-                        'line_id': item['line_id'],
-                        'model_intervals': intervals_orig,
-                        'pred_prob': pred_prob,
-                        'image_width': item['image_width'],
-                        'rule_intervals': item['rule_intervals']
-                    })
-        
-        # Step 3: 并行计算AL分数
-        print(f"[INFO] 并行计算AL分数（{num_workers} 线程）...")
-        scores = []
-        
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(self._compute_al_score_from_result, pred): pred['line_id']
-                      for pred in pred_results}
+        for chunk_idx, chunk_line_ids in enumerate(chunks):
+            print(f"\n{'='*60}")
+            print(f"[INFO] 处理第 {chunk_idx + 1}/{num_chunks} 个chunk（{len(chunk_line_ids)} 行）")
+            print(f"{'='*60}")
             
-            for future in tqdm(as_completed(futures), total=len(futures), desc="AL评分"):
-                result = future.result()
-                scores.append(result)
+            # Step 1: 并行提取当前chunk的特征
+            print(f"[INFO] 并行提取特征（{num_workers} 线程）...")
+            line_data_list = []
+            
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(self._extract_features_for_line, line_id): line_id 
+                          for line_id in chunk_line_ids}
+                
+                for future in tqdm(as_completed(futures), total=len(futures), desc="特征提取"):
+                    result = future.result()
+                    if result is not None:
+                        line_data_list.append(result)
+            
+            if not line_data_list:
+                print("[WARN] 当前chunk没有有效的行数据")
+                continue
+            
+            print(f"[INFO] 成功提取 {len(line_data_list)} 行特征")
+            
+            # Step 2: GPU批量推理
+            print(f"[INFO] GPU批量推理（batch_size={batch_size}）...")
+            pred_results = []
+            num_batches = (len(line_data_list) + batch_size - 1) // batch_size
+            
+            with torch.no_grad():
+                for batch_idx in tqdm(range(num_batches), desc="批量推理"):
+                    start = batch_idx * batch_size
+                    end = min(start + batch_size, len(line_data_list))
+                    batch_data = line_data_list[start:end]
+                    
+                    if not batch_data:
+                        continue
+                    
+                    max_width = max(item['resized_w'] for item in batch_data)
+                    n_channels = batch_data[0]['features'].shape[1]
+                    
+                    batch_features = np.zeros((len(batch_data), n_channels, max_width), dtype=np.float32)
+                    for i, item in enumerate(batch_data):
+                        w = item['resized_w']
+                        batch_features[i, :, :w] = item['features'].transpose(1, 0)
+                    
+                    features_tensor = torch.from_numpy(batch_features).to(device)
+                    output = model(features_tensor)
+                    pred_probs = torch.sigmoid(output).cpu().numpy()
+                    
+                    for i, item in enumerate(batch_data):
+                        w = item['resized_w']
+                        pred_prob = pred_probs[i, 0, :w]
+                        
+                        intervals = IntervalExtractor.extract(pred_prob, threshold, max_gap)
+                        
+                        inv_scale = 1.0 / item['scale'] if item['scale'] > 0 else 1.0
+                        intervals_orig = [
+                            (int(round(s * inv_scale)), int(round(e * inv_scale)))
+                            for s, e in intervals
+                        ]
+                        
+                        pred_results.append({
+                            'line_id': item['line_id'],
+                            'model_intervals': intervals_orig,
+                            'pred_prob': pred_prob,
+                            'image_width': item['image_width'],
+                            'rule_intervals': item['rule_intervals']
+                        })
+            
+            # Step 3: 并行计算AL分数
+            print(f"[INFO] 并行计算AL分数（{num_workers} 线程）...")
+            chunk_scores = []
+            
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(self._compute_al_score_from_result, pred): pred['line_id']
+                          for pred in pred_results}
+                
+                for future in tqdm(as_completed(futures), total=len(futures), desc="AL评分"):
+                    result = future.result()
+                    chunk_scores.append(result)
+            
+            # Step 4: 更新全局Top N排名
+            global_top_scores.extend(chunk_scores)
+            global_top_scores.sort(key=lambda x: x['al_score'], reverse=True)
+            global_top_scores = global_top_scores[:top_n * 2]
+            
+            # 显示当前Top排名
+            processed_lines = (chunk_idx + 1) * chunk_size
+            processed_lines = min(processed_lines, total_lines)
+            
+            print(f"\n[INFO] 当前已处理 {processed_lines}/{total_lines} 行")
+            print(f"[INFO] 当前Top {min(top_n, len(global_top_scores))} 排名：")
+            print("-" * 90)
+            print(f"{'排名':<4} {'行ID':<40} {'AL分数':<10} {'分歧':<10}")
+            print("-" * 90)
+            
+            for idx, item in enumerate(global_top_scores[:top_n], 1):
+                print(f"{idx:<4} {item['line_id']:<40} {item['al_score']:<10.4f} {item['disagreement']:<10.4f}")
         
-        scores.sort(key=lambda x: x['al_score'], reverse=True)
+        global_top_scores.sort(key=lambda x: x['al_score'], reverse=True)
         
-        return scores[:top_n]
+        return global_top_scores[:top_n]
 
 
 @click.command("active-learn")
@@ -403,7 +432,9 @@ class ActiveLearner:
               help="GPU批量推理批大小")
 @click.option("--num-workers", type=int, default=4, show_default=True,
               help="并行特征提取和评分的线程数")
-def cli(top_n, model_path, data_base_path, output, batch_size, num_workers):
+@click.option("--chunk-size", type=int, default=1000, show_default=True,
+              help="微批量大小，每处理完一个chunk更新一次排名")
+def cli(top_n, model_path, data_base_path, output, batch_size, num_workers, chunk_size):
     """
     主动学习：找出最需要标注的行
 
@@ -411,6 +442,7 @@ def cli(top_n, model_path, data_base_path, output, batch_size, num_workers):
     等指标排序，返回最需要人工标注的 Top N 行。
 
     使用 GPU 批量推理和多线程并行处理加速计算。
+    数据按chunk分块处理，每处理完一个chunk立即显示当前Top排名，快速看到结果。
     """
     import torch
     
@@ -427,8 +459,8 @@ def cli(top_n, model_path, data_base_path, output, batch_size, num_workers):
     click.echo(f"[INFO] 加载模型: {model_file}")
     learner = ActiveLearner(model_file, data_path)
 
-    click.echo(f"[INFO] 开始计算主动学习分数（batch_size={batch_size}, num_workers={num_workers}）...")
-    ranked_lines = learner.rank_lines_batched(top_n, batch_size=batch_size, num_workers=num_workers)
+    click.echo(f"[INFO] 开始计算主动学习分数（batch_size={batch_size}, num_workers={num_workers}, chunk_size={chunk_size}）...")
+    ranked_lines = learner.rank_lines_batched(top_n, batch_size=batch_size, num_workers=num_workers, chunk_size=chunk_size)
 
     click.echo(f"\n[INFO] Top {len(ranked_lines)} 需要优先标注的行：")
     click.echo("-" * 120)

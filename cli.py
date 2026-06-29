@@ -151,7 +151,9 @@ def train_split_dataset(train_ratio, seed, sort_by_width, data_base_path, output
               help="GPU批量推理批大小")
 @click.option("--num-workers", type=int, default=4, show_default=True,
               help="并行特征提取和评分的线程数")
-def train_active_learn(top_n, model_path, data_base_path, batch_size, num_workers):
+@click.option("--chunk-size", type=int, default=1000, show_default=True,
+              help="微批量大小，每处理完一个chunk更新一次排名")
+def train_active_learn(top_n, model_path, data_base_path, batch_size, num_workers, chunk_size):
     """主动学习：找出最需要标注的行（使用GPU批量并行推理加速）"""
     from ai_model.train.active_learning import ActiveLearner
 
@@ -169,8 +171,8 @@ def train_active_learn(top_n, model_path, data_base_path, batch_size, num_worker
 
     click.echo(f"[INFO] 加载模型: {model_file}")
     learner = ActiveLearner(model_file, data_path)
-    click.echo(f"[INFO] 开始计算主动学习分数（batch_size={batch_size}, num_workers={num_workers}）...")
-    ranked_lines = learner.rank_lines_batched(top_n, batch_size=batch_size, num_workers=num_workers)
+    click.echo(f"[INFO] 开始计算主动学习分数（batch_size={batch_size}, num_workers={num_workers}, chunk_size={chunk_size}）...")
+    ranked_lines = learner.rank_lines_batched(top_n, batch_size=batch_size, num_workers=num_workers, chunk_size=chunk_size)
 
     click.echo(f"\n[INFO] Top {len(ranked_lines)} 需要优先标注的行：")
     click.echo("-" * 120)
