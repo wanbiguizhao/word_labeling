@@ -208,7 +208,7 @@ def main(config: TrainConfig = None):
     
     if split_path.exists():
         print("[INFO] 从划分文件加载数据集...")
-        from data.generate_dataset_split import load_dataset_split
+        from ai_model.data.generate_dataset_split import load_dataset_split
         
         split_info = load_dataset_split(split_path)
         train_ids = split_info['train_ids']
