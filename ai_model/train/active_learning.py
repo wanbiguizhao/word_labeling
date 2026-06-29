@@ -6,6 +6,7 @@ from typing import List, Tuple, Dict, Optional
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+import cv2
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(PROJECT_ROOT))
@@ -295,8 +296,6 @@ class ActiveLearner:
         Returns:
             按AL分数从高到低排序的行列表
         """
-        import cv2
-        
         line_ids = load_all_line_ids(self.data_base_path)
         total_lines = len(line_ids)
         print(f"[INFO] 总共有 {total_lines} 个行数据")
