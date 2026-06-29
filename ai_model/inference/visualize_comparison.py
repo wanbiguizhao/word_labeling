@@ -306,8 +306,11 @@ def draw_comparison(
               show_default=True, help="规则后处理合并：合并后宽高比下限")
 @click.option("--merge-max-ratio", type=float, default=DEFAULT_MERGE_MAX_RATIO,
               show_default=True, help="规则后处理合并：合并后宽高比上限")
+@click.option("--threshold", type=float, default=0.3, show_default=True,
+              help="模型预测概率阈值")
 def cli(line_id, data_base_path, model_path, image_path, rule_json_path, save_dir,
-        max_gap, merge_min_gap, merge_single_ratio, merge_min_ratio, merge_max_ratio):
+        max_gap, merge_min_gap, merge_single_ratio, merge_min_ratio, merge_max_ratio,
+        threshold):
     """
     对比规则与模型的切割结果
 
@@ -380,6 +383,7 @@ def cli(line_id, data_base_path, model_path, image_path, rule_json_path, save_di
     click.echo(f"[INFO] 加载模型: {model_file}")
     predictor = CharSegmentPredictor(model_file)
     predictor.max_gap = max_gap
+    predictor.threshold = threshold
 
     model_intervals, pred_prob, scale = predictor.predict(img)
     click.echo(f"[INFO] 模型预测区间: {len(model_intervals)} 个字符")

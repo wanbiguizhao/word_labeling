@@ -265,9 +265,12 @@ def predict_line(image_path, model_path, output, threshold, max_gap):
               help="规则后处理合并：合并后宽高比下限")
 @click.option("--merge-max-ratio", type=float, default=1.5, show_default=True,
               help="规则后处理合并：合并后宽高比上限")
+@click.option("--threshold", type=float, default=0.3, show_default=True,
+              help="模型预测概率阈值")
 def predict_compare(line_id, data_base_path, image_path, rule_json_path,
                     model_path, save_dir, max_gap, merge_min_gap,
-                    merge_single_ratio, merge_min_ratio, merge_max_ratio):
+                    merge_single_ratio, merge_min_ratio, merge_max_ratio,
+                    threshold):
     """对比规则与模型的切割结果（生成五行可视化图）"""
     # 直接委托给 visualize_comparison 的 CLI
     from ai_model.inference.visualize_comparison import cli as viz_cli
@@ -294,6 +297,8 @@ def predict_compare(line_id, data_base_path, image_path, rule_json_path,
         argv += ["--merge-min-ratio", str(merge_min_ratio)]
     if abs(merge_max_ratio - 1.5) > 1e-6:
         argv += ["--merge-max-ratio", str(merge_max_ratio)]
+    if abs(threshold - 0.3) > 1e-6:
+        argv += ["--threshold", str(threshold)]
 
     sys.argv = argv
     viz_cli()

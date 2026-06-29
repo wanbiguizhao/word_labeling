@@ -240,8 +240,9 @@ def split_interval_iou(pred, target, threshold=0.5, char_width: float = 16.0):
         
         # 计算字符区IOU
         char_mask = line_target.float()
-        char_intersection = (pred_bin[i] * char_mask).sum() if pred_bin.dim() == 2 else (pred_bin * char_mask).sum()
-        char_union = pred_bin[i].sum() * char_mask.sum() + char_mask.sum() - char_intersection if pred_bin.dim() == 2 else pred_bin.sum() * char_mask.sum() + char_mask.sum() - char_intersection
+        char_pred = pred_bin[i] if pred_bin.dim() == 2 else pred_bin
+        char_intersection = (char_pred * char_mask).sum()
+        char_union = char_pred.sum() + char_mask.sum() - char_intersection
         
         if char_mask.sum() > 0:
             total_char_iou += (char_intersection + 1e-6) / (char_union + 1e-6) if char_union > 0 else 0
@@ -258,14 +259,14 @@ def split_interval_iou(pred, target, threshold=0.5, char_width: float = 16.0):
                 gap_width = gap_end - gap_start + 1
                 
                 if gap_width > 0 and gap_width <= char_width:
-                    gap_mask = torch.zeros(width, device=line_target.device)
-                    gap_mask[gap_start:gap_end + 1] = 1.0
-                    
                     gap_pred = pred_bin[i, gap_start:gap_end + 1] if pred_bin.dim() == 2 else pred_bin[gap_start:gap_end + 1]
                     gap_tgt = line_target[gap_start:gap_end + 1].float()
                     
-                    gap_intersection += (gap_pred * gap_tgt).sum()
-                    gap_union += gap_pred.sum() + gap_tgt.sum() - (gap_pred * gap_tgt).sum()
+                    gap_pred_inv = 1.0 - gap_pred
+                    gap_tgt_inv = 1.0 - gap_tgt
+                    
+                    gap_intersection += (gap_pred_inv * gap_tgt_inv).sum()
+                    gap_union += gap_pred_inv.sum() + gap_tgt_inv.sum() - (gap_pred_inv * gap_tgt_inv).sum()
         
         if gap_union > 0:
             total_gap_iou += (gap_intersection + 1e-6) / (gap_union + 1e-6)

@@ -32,7 +32,7 @@ datahome/
 *.onnx
 
 # Output directories
-output/
+output/*png
 visualization/
 /models/
 auto_login/download_data/
