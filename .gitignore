@@ -34,7 +34,7 @@ datahome/
 # Output directories
 output/
 visualization/
-models/
+/models/
 auto_login/download_data/
 
 # IDE
