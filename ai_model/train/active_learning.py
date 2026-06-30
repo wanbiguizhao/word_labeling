@@ -141,7 +141,7 @@ class ActiveLearner:
         if result is None:
             return None
         
-        model_intervals, pred_prob, scale = result
+        model_intervals, pred_prob, pred_logits, scale = result
         
         rule_intervals = self.load_rule_intervals(line_id)
         if rule_intervals is None:
@@ -422,6 +422,447 @@ class ActiveLearner:
         return global_top_scores[:top_n]
 
 
+MERGE_MIN_GAP = 3
+MERGE_MAX_HEIGHT_DIFF = 0.2
+MERGE_SINGLE_ASPECT_RATIO = 0.7
+MERGE_MIN_ASPECT_RATIO = 0.5
+MERGE_MAX_ASPECT_RATIO = 1.5
+
+
+class RuleBasedActiveLearner:
+    def __init__(self, data_base_path: Path):
+        self.data_base_path = data_base_path
+        self.rule_jsons_dir = data_base_path / "rule_jsons"
+        self.lines_dir = data_base_path / "lines"
+    
+    def load_rule_json(self, line_id: str) -> Optional[dict]:
+        json_path = self.rule_jsons_dir / f"{line_id}_rule.json"
+        if not json_path.exists():
+            return None
+        
+        with open(json_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    
+    def _merge_chars(self, chars: List[dict], image_height: int) -> List[dict]:
+        """
+        对原始切割结果执行合并后处理，与训练时的 LabelGenerator._merge_narrow_chars 逻辑一致
+        
+        合并条件：
+        1. 间隙 < min_gap
+        2. 两个字符宽高比 < single_ratio（都窄）
+        3. 合并后宽高比在 [min_ratio, max_ratio] 范围
+        """
+        if len(chars) < 2:
+            return chars
+        
+        intervals = [(char['col_start'], char['col_end']) for char in chars]
+        
+        merged_intervals = []
+        for start, end in intervals:
+            if not merged_intervals:
+                merged_intervals.append((start, end))
+            else:
+                last_start, last_end = merged_intervals[-1]
+                gap = start - last_end - 1
+                
+                if gap >= 0 and gap < MERGE_MIN_GAP:
+                    w1 = last_end - last_start
+                    w2 = end - start
+                    r1 = w1 / image_height
+                    r2 = w2 / image_height
+                    
+                    if r1 < MERGE_SINGLE_ASPECT_RATIO and r2 < MERGE_SINGLE_ASPECT_RATIO:
+                        merged_w = end - last_start
+                        merged_r = merged_w / image_height
+                        
+                        if MERGE_MIN_ASPECT_RATIO < merged_r < MERGE_MAX_ASPECT_RATIO:
+                            merged_intervals[-1] = (last_start, end)
+                            continue
+                
+                merged_intervals.append((start, end))
+        
+        merged_chars = []
+        for start, end in merged_intervals:
+            merged_chars.append({
+                'col_start': start,
+                'col_end': end,
+                'width': end - start
+            })
+        
+        return merged_chars
+    
+    def narrow_char_score(self, chars: List[dict], image_height: int) -> float:
+        """
+        窄字符比例：宽度远小于平均宽度的字符比例
+        
+        窄字符定义：width < 平均宽度 * 0.5 且 width/height < 0.5
+        """
+        if len(chars) < 2:
+            return 0.0
+        
+        widths = [char.get('width', 0) for char in chars if char.get('width', 0) > 0]
+        if not widths:
+            return 0.0
+        
+        avg_width = np.mean(widths)
+        narrow_count = 0
+        
+        for char in chars:
+            w = char.get('width', 0)
+            if w > 0 and w < avg_width * 0.5:
+                if image_height > 0:
+                    aspect_ratio = w / image_height
+                    if aspect_ratio < 0.5:
+                        narrow_count += 1
+                else:
+                    narrow_count += 1
+        
+        return narrow_count / len(chars)
+    
+    def stuck_char_score(self, chars: List[dict], image_height: int) -> float:
+        """
+        粘连字符分数：合并后仍存在宽高比在 1.5~3.0 之间的字符比例
+        
+        这些字符很可能是两个汉字粘在一起没有被正确切割
+        
+        判定条件：1.5 < width/height <= 3.0
+        """
+        if len(chars) == 0 or image_height <= 0:
+            return 0.0
+        
+        stuck_count = 0
+        for char in chars:
+            w = char.get('width', 0)
+            if w > 0:
+                aspect_ratio = w / image_height
+                if 1.5 < aspect_ratio <= 3.0:
+                    stuck_count += 1
+        
+        return stuck_count / len(chars)
+    
+    def over_merge_score(self, chars_merged: List[dict], image_height: int) -> float:
+        """
+        合并过度分数：合并后宽高比 > 1.5 的字符比例
+        
+        合并后宽度仍然过大，说明可能合并了不该合并的字符（合并错误）
+        
+        判定条件：width/height > 1.5
+        """
+        if len(chars_merged) == 0 or image_height <= 0:
+            return 0.0
+        
+        over_count = 0
+        for char in chars_merged:
+            w = char.get('width', 0)
+            if w > 0:
+                aspect_ratio = w / image_height
+                if aspect_ratio > 1.5:
+                    over_count += 1
+        
+        return over_count / len(chars_merged)
+    
+    def under_merge_score(self, chars_merged: List[dict], image_height: int) -> float:
+        """
+        合并不足分数：合并后仍存在相邻窄字符+小间隙的情况
+        
+        合并后仍有相邻字符都窄（width/height < 0.7）且间隙很小（gap < 3px），
+        说明这些字符应该被合并但没有被合并
+        
+        判定条件：相邻两字符宽高比均 < 0.7，且间隙 < 3px
+        """
+        if len(chars_merged) < 2 or image_height <= 0:
+            return 0.0
+        
+        under_count = 0
+        total_pairs = 0
+        
+        for i in range(1, len(chars_merged)):
+            prev = chars_merged[i-1]
+            curr = chars_merged[i]
+            
+            w1 = prev.get('width', 0)
+            w2 = curr.get('width', 0)
+            gap = curr.get('col_start', 0) - prev.get('col_end', 0)
+            
+            if w1 > 0 and w2 > 0:
+                r1 = w1 / image_height
+                r2 = w2 / image_height
+                total_pairs += 1
+                
+                if r1 < 0.7 and r2 < 0.7 and 0 <= gap < 3:
+                    under_count += 1
+        
+        if total_pairs == 0:
+            return 0.0
+        return under_count / total_pairs
+    
+    def wide_char_score(self, chars: List[dict], image_height: int) -> float:
+        """
+        宽字符比例：宽度远大于平均宽度的字符比例
+        
+        宽字符定义：width > 平均宽度 * 2.0 或 width/height > 2.0
+        """
+        if len(chars) < 2:
+            return 0.0
+        
+        widths = [char.get('width', 0) for char in chars if char.get('width', 0) > 0]
+        if not widths:
+            return 0.0
+        
+        avg_width = np.mean(widths)
+        wide_count = 0
+        
+        for char in chars:
+            w = char.get('width', 0)
+            if w > 0:
+                is_wide_by_avg = w > avg_width * 2.0
+                is_wide_by_aspect = False
+                if image_height > 0:
+                    is_wide_by_aspect = (w / image_height) > 2.0
+                if is_wide_by_avg or is_wide_by_aspect:
+                    wide_count += 1
+        
+        return wide_count / len(chars)
+    
+    def gap_anomaly_score(self, chars: List[dict], image_width: int) -> float:
+        """
+        间隙异常分数：过小或过大的间隙比例
+        
+        间隙过小：gap < 2px（可能是分割过细）
+        间隙过大：gap > 平均间隙 * 3.0（可能漏分割）
+        """
+        if len(chars) < 2:
+            return 0.0
+        
+        gaps = []
+        for i in range(1, len(chars)):
+            prev_end = chars[i-1].get('col_end', 0)
+            curr_start = chars[i].get('col_start', 0)
+            gap = curr_start - prev_end
+            if gap >= 0:
+                gaps.append(gap)
+        
+        if not gaps:
+            return 0.0
+        
+        avg_gap = np.mean(gaps)
+        anomaly_count = 0
+        
+        for gap in gaps:
+            if gap < 2 or (avg_gap > 0 and gap > avg_gap * 3.0):
+                anomaly_count += 1
+        
+        return anomaly_count / len(gaps)
+    
+    def width_variance_score(self, chars: List[dict]) -> float:
+        """
+        字符宽度变异系数：宽度标准差 / 平均宽度
+        
+        值越大表示宽度变化越大，可能分割不稳定
+        """
+        widths = [char.get('width', 0) for char in chars if char.get('width', 0) > 0]
+        if len(widths) < 2:
+            return 0.0
+        
+        avg_width = np.mean(widths)
+        std_width = np.std(widths)
+        
+        if avg_width == 0:
+            return 0.0
+        
+        cv = std_width / avg_width
+        return min(cv, 2.0) / 2.0
+    
+    def extreme_aspect_ratio_score(self, chars: List[dict], image_height: int) -> float:
+        """
+        极端宽高比字符比例：宽高比 < 0.3 或 > 3.0 的字符比例
+        
+        极端宽高比通常表示分割错误
+        """
+        if len(chars) == 0 or image_height <= 0:
+            return 0.0
+        
+        extreme_count = 0
+        for char in chars:
+            w = char.get('width', 0)
+            if w > 0:
+                aspect_ratio = w / image_height
+                if aspect_ratio < 0.3 or aspect_ratio > 3.0:
+                    extreme_count += 1
+        
+        return extreme_count / len(chars)
+    
+    def empty_region_score(self, chars: List[dict], image_width: int) -> float:
+        """
+        空白区域比例：最左边字符之前和最右边字符之后的空白区域
+        
+        空白区域过大可能表示漏识别或图像边缘问题
+        """
+        if len(chars) == 0 or image_width <= 0:
+            return 0.0
+        
+        first_start = chars[0].get('col_start', image_width)
+        last_end = chars[-1].get('col_end', 0)
+        
+        left_empty = first_start
+        right_empty = image_width - last_end - 1
+        
+        total_empty = left_empty + right_empty
+        return min(total_empty / image_width, 1.0)
+    
+    def line_density_score(self, chars: List[dict], image_width: int) -> float:
+        """
+        行密度异常分数：字符总宽度占图像宽度的比例
+        
+        密度过低：可能是稀疏文本或漏识别
+        密度过高：可能是粘连严重或分割过粗
+        """
+        if len(chars) == 0 or image_width <= 0:
+            return 0.0
+        
+        total_char_width = sum(char.get('width', 0) for char in chars)
+        density = total_char_width / image_width
+        
+        if density < 0.1 or density > 0.8:
+            return min(abs(density - 0.45) / 0.45, 1.0)
+        
+        return 0.0
+    
+    def compute_al_score(self, line_id: str) -> Optional[Dict]:
+        """
+        基于规则切割结果计算主动学习分数（以合并后指标为主）
+        
+        重点检测三类问题：
+        1. 粘连字符：合并后宽高比 1.5~3.0，可能是两个汉字没切割开
+        2. 合并过度：合并后宽高比 > 1.5，可能合并了不该合并的字符
+        3. 合并不足：合并后仍有相邻窄字符+小间隙，该合并的没合并
+        
+        综合分数 = w1 * 粘连字符 + w2 * 合并过度 + w3 * 合并不足 +
+                   w4 * 合并后宽字符 + w5 * 合并后间隙异常 + w6 * 合并后宽度变异 +
+                   w7 * 合并率 + w8 * 合并后窄字符 + w9 * 合并后极端宽高比
+        """
+        rule_data = self.load_rule_json(line_id)
+        if rule_data is None:
+            return None
+        
+        chars_raw = rule_data.get('chars', [])
+        image_width = rule_data.get('image_width', 0)
+        image_height = rule_data.get('image_height', 0)
+        
+        if len(chars_raw) == 0:
+            return None
+        
+        chars_merged = self._merge_chars(chars_raw, image_height)
+        
+        # === 核心指标（合并后，高权重） ===
+        stuck_score = self.stuck_char_score(chars_merged, image_height)
+        over_merge = self.over_merge_score(chars_merged, image_height)
+        under_merge = self.under_merge_score(chars_merged, image_height)
+        
+        # === 辅助指标（合并后，中权重） ===
+        merged_wide = self.wide_char_score(chars_merged, image_height)
+        merged_gap_anomaly = self.gap_anomaly_score(chars_merged, image_width)
+        merged_width_variance = self.width_variance_score(chars_merged)
+        merged_narrow = self.narrow_char_score(chars_merged, image_height)
+        merged_extreme = self.extreme_aspect_ratio_score(chars_merged, image_height)
+        
+        # === 参考指标（低权重） ===
+        merge_ratio = 0.0
+        if len(chars_raw) > 0:
+            merge_ratio = 1.0 - len(chars_merged) / len(chars_raw)
+        
+        weights = {
+            'stuck_char': 0.25,       # 粘连字符（最重要）
+            'over_merge': 0.20,       # 合并过度
+            'under_merge': 0.15,      # 合并不足
+            'merged_wide': 0.10,      # 合并后宽字符
+            'merged_gap_anomaly': 0.08,  # 合并后间隙异常
+            'merged_width_variance': 0.07,  # 合并后宽度变异
+            'merged_narrow': 0.05,    # 合并后窄字符
+            'merged_extreme': 0.05,   # 合并后极端宽高比
+            'merge_ratio': 0.05       # 合并率（参考）
+        }
+        
+        al_score = (
+            weights['stuck_char'] * stuck_score +
+            weights['over_merge'] * over_merge +
+            weights['under_merge'] * under_merge +
+            weights['merged_wide'] * merged_wide +
+            weights['merged_gap_anomaly'] * merged_gap_anomaly +
+            weights['merged_width_variance'] * merged_width_variance +
+            weights['merged_narrow'] * merged_narrow +
+            weights['merged_extreme'] * merged_extreme +
+            weights['merge_ratio'] * merge_ratio
+        )
+        
+        return {
+            'line_id': line_id,
+            'al_score': al_score,
+            'stuck_char': stuck_score,
+            'over_merge': over_merge,
+            'under_merge': under_merge,
+            'merged_wide': merged_wide,
+            'merged_gap_anomaly': merged_gap_anomaly,
+            'merged_width_variance': merged_width_variance,
+            'merged_narrow': merged_narrow,
+            'merged_extreme': merged_extreme,
+            'merge_ratio': merge_ratio,
+            'total_chars_raw': len(chars_raw),
+            'total_chars_merged': len(chars_merged),
+            'image_width': image_width,
+            'image_height': image_height
+        }
+    
+    def rank_lines(self, top_n: int = 100, chunk_size: int = 1000) -> List[Dict]:
+        """
+        基于规则切割结果对所有行数据进行主动学习排序
+        
+        返回：按AL分数从高到低排序的行列表（最可能切割错误的排在前面）
+        """
+        line_ids = load_all_line_ids(self.data_base_path)
+        total_lines = len(line_ids)
+        print(f"[INFO] 总共有 {total_lines} 个行数据")
+        
+        chunks = [line_ids[i:i+chunk_size] for i in range(0, total_lines, chunk_size)]
+        num_chunks = len(chunks)
+        print(f"[INFO] 分成 {num_chunks} 个chunk，每chunk {chunk_size} 个")
+        
+        global_top_scores = []
+        
+        for chunk_idx, chunk_line_ids in enumerate(chunks):
+            print(f"\n{'='*60}")
+            print(f"[INFO] 处理第 {chunk_idx + 1}/{num_chunks} 个chunk（{len(chunk_line_ids)} 行）")
+            print(f"{'='*60}")
+            
+            chunk_scores = []
+            for line_id in tqdm(chunk_line_ids, desc="规则分析"):
+                result = self.compute_al_score(line_id)
+                if result is not None:
+                    chunk_scores.append(result)
+            
+            global_top_scores.extend(chunk_scores)
+            global_top_scores.sort(key=lambda x: x['al_score'], reverse=True)
+            global_top_scores = global_top_scores[:top_n * 2]
+            
+            processed_lines = (chunk_idx + 1) * chunk_size
+            processed_lines = min(processed_lines, total_lines)
+            
+            print(f"\n[INFO] 当前已处理 {processed_lines}/{total_lines} 行")
+            print(f"[INFO] 当前Top {min(top_n, len(global_top_scores))} 排名：")
+            print("-" * 120)
+            print(f"{'排名':<4} {'行ID':<40} {'AL分数':<10} {'粘连':<8} {'过度合并':<8} {'合并不足':<8} {'合并率':<8}")
+            print("-" * 120)
+            
+            for idx, item in enumerate(global_top_scores[:top_n], 1):
+                print(f"{idx:<4} {item['line_id']:<40} {item['al_score']:<10.4f} "
+                      f"{item['stuck_char']:<8.4f} {item['over_merge']:<8.4f} "
+                      f"{item['under_merge']:<8.4f} {item['merge_ratio']:<8.4f}")
+        
+        global_top_scores.sort(key=lambda x: x['al_score'], reverse=True)
+        
+        return global_top_scores[:top_n]
+
+
 @click.command("active-learn")
 @click.argument("top_n", type=int, default=100)
 @click.option("--model-path", type=click.Path(exists=True), default=None, help="模型权重路径")
@@ -473,6 +914,55 @@ def cli(top_n, model_path, data_base_path, output, batch_size, num_workers, chun
                    f"{item['count_diff']:<10.4f}")
 
     output_path = Path(output) if output else model_dir / "al_ranking.json"
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(ranked_lines, f, indent=2, ensure_ascii=False)
+
+    click.echo(f"\n[INFO] 排名结果已保存到: {output_path}")
+
+
+@click.command("rule-based-al")
+@click.argument("top_n", type=int, default=100)
+@click.option("--data-base-path", type=click.Path(exists=True), default=None,
+              help="数据基础目录（默认: <项目根>/datahome）")
+@click.option("--output", type=str, default=None, help="排名结果输出路径")
+@click.option("--chunk-size", type=int, default=1000, show_default=True,
+              help="微批量大小，每处理完一个chunk更新一次排名")
+def cli_rule_based(top_n, data_base_path, output, chunk_size):
+    """
+    基于规则的主动学习：仅使用规则切割结果识别可能切割错误的样本
+    
+    不需要训练好的模型，直接分析规则JSON中的字符特征：
+    - 窄字符比例：宽度远小于平均宽度的字符（可能是分割过细）
+    - 宽字符比例：宽度远大于平均宽度的字符（可能是粘连未分开）
+    - 间隙异常：过小或过大的间隙（可能分割错误）
+    - 宽度变异系数：字符宽度变化大（分割不稳定）
+    - 极端宽高比：宽高比异常的字符（分割错误）
+    - 空白区域：行首行尾空白过大（漏识别）
+    - 行密度异常：字符密度过高或过低（粘连或漏识别）
+    
+    返回最可能切割错误的 Top N 行，用于人工审核和标注。
+    """
+    base_dir = Path(__file__).resolve().parent.parent.parent
+    data_path = Path(data_base_path) if data_base_path else base_dir / "datahome"
+    model_dir = base_dir / "ai_model" / "models"
+
+    click.echo(f"[INFO] 数据目录: {data_path}")
+    learner = RuleBasedActiveLearner(data_path)
+
+    click.echo(f"[INFO] 开始基于规则的主动学习分析（chunk_size={chunk_size}）...")
+    ranked_lines = learner.rank_lines(top_n, chunk_size=chunk_size)
+
+    click.echo(f"\n[INFO] Top {len(ranked_lines)} 最可能切割错误的行：")
+    click.echo("-" * 130)
+    click.echo(f"{'排名':<4} {'行ID':<40} {'AL分数':<10} {'窄字符':<10} {'宽字符':<10} {'间隙异常':<10} {'宽度变异':<10}")
+    click.echo("-" * 130)
+
+    for idx, item in enumerate(ranked_lines, 1):
+        click.echo(f"{idx:<4} {item['line_id']:<40} {item['al_score']:<10.4f} "
+                   f"{item['narrow_char']:<10.4f} {item['wide_char']:<10.4f} "
+                   f"{item['gap_anomaly']:<10.4f} {item['width_variance']:<10.4f}")
+
+    output_path = Path(output) if output else model_dir / "rule_based_al_ranking.json"
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(ranked_lines, f, indent=2, ensure_ascii=False)
 

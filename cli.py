@@ -191,6 +191,41 @@ def train_active_learn(top_n, model_path, data_base_path, batch_size, num_worker
     click.echo(f"\n[INFO] 排名结果已保存到: {output_path}")
 
 
+@train.command("rule-based-al")
+@click.argument("top_n", type=int, default=100)
+@click.option("--data-base-path", type=click.Path(exists=True), default=None,
+              help="数据基础目录（默认: <项目根>/datahome）")
+@click.option("--chunk-size", type=int, default=1000, show_default=True,
+              help="微批量大小，每处理完一个chunk更新一次排名")
+def train_rule_based_al(top_n, data_base_path, chunk_size):
+    """基于规则的主动学习：仅使用规则切割结果识别可能切割错误的样本"""
+    from ai_model.train.active_learning import RuleBasedActiveLearner
+
+    data_path = Path(data_base_path) if data_base_path else BASE_DIR / "datahome"
+    model_dir = BASE_DIR / "ai_model" / "models"
+
+    click.echo(f"[INFO] 数据目录: {data_path}")
+    learner = RuleBasedActiveLearner(data_path)
+    click.echo(f"[INFO] 开始基于规则的主动学习分析（chunk_size={chunk_size}）...")
+    ranked_lines = learner.rank_lines(top_n, chunk_size=chunk_size)
+
+    click.echo(f"\n[INFO] Top {len(ranked_lines)} 最可能切割错误的行：")
+    click.echo("-" * 130)
+    click.echo(f"{'排名':<4} {'行ID':<40} {'AL分数':<10} {'粘连':<8} {'过度合并':<8} {'合并不足':<8} {'合并率':<8}")
+    click.echo("-" * 130)
+
+    for idx, item in enumerate(ranked_lines, 1):
+        click.echo(f"{idx:<4} {item['line_id']:<40} {item['al_score']:<10.4f} "
+                   f"{item['stuck_char']:<8.4f} {item['over_merge']:<8.4f} "
+                   f"{item['under_merge']:<8.4f} {item['merge_ratio']:<8.4f}")
+
+    output_path = model_dir / "rule_based_al_ranking.json"
+    import json
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(ranked_lines, f, indent=2, ensure_ascii=False)
+    click.echo(f"\n[INFO] 排名结果已保存到: {output_path}")
+
+
 # ============================================================
 # 命令组：predict - 模型推理
 # ============================================================

@@ -133,10 +133,10 @@ def load_rule_intervals(rule_json_path: Path) -> List[Tuple[int, int]]:
 
 def compute_prob_map(pred_prob: np.ndarray, orig_width: int, scale: float) -> Tuple[np.ndarray, np.ndarray]:
     """
-    将模型概率映射回原始图像宽度
+    将模型概率映射回原始图像宽度（用于可视化，无阈值截断）
 
     Args:
-        pred_prob: 模型输出的概率数组（缩放后宽度）
+        pred_prob: sigmoid后的概率数组（0-1之间，缩放后宽度）
         orig_width: 原始图像宽度
         scale: 缩放比例
 
@@ -156,11 +156,10 @@ def compute_prob_map(pred_prob: np.ndarray, orig_width: int, scale: float) -> Tu
         prob_map[orig_col] += prob
         count_map[orig_col] += 1
 
-    # 平均处理：多个缩放列映射到同一原始列时取平均
     mask = count_map > 0
     prob_map[mask] /= count_map[mask]
 
-    bar_heights = np.ceil(prob_map * PROB_MAX_PIXEL).astype(np.int32)
+    bar_heights = np.maximum(1, np.round(prob_map * PROB_MAX_PIXEL)).astype(np.int32)
 
     return prob_map, bar_heights
 
@@ -265,15 +264,22 @@ def draw_comparison(
     draw.line([(0, current_y), (W, current_y)], fill=SEP_LINE_COLOR, width=sep)
 
     # =====================================
-    # 最后行：概率热力图
+    # 最后行：概率热力图（使用sigmoid后的真实概率值，无阈值截断）
     # =====================================
     prob_map, bar_heights = compute_prob_map(pred_prob, W, scale)
 
     for col in range(W):
-        bar_height = bar_heights[col]
-        if bar_height > 0:
-            y_start = total_height - bar_height
-            draw.line([(col, y_start), (col, total_height)], fill=(255, 255, 0), width=1)
+        prob = prob_map[col]
+        bar_height = max(1, int(round(prob * PROB_MAX_PIXEL)))
+        print(prob,bar_height)
+        y_start = total_height - bar_height
+        y_end = total_height
+        
+        r = int(255 )
+        g = int(0)
+        b = int(0)
+        
+        draw.line([(col, y_start), (col, y_end)], fill=(r, g, b), width=1)
 
     # 概率图顶部的红色参考线
     draw.line([(0, current_y + sep), (W, current_y + sep)], fill=(255, 0, 0), width=1)
@@ -385,8 +391,17 @@ def cli(line_id, data_base_path, model_path, image_path, rule_json_path, save_di
     predictor.max_gap = max_gap
     predictor.threshold = threshold
 
-    model_intervals, pred_prob, scale = predictor.predict(img)
+    model_intervals, pred_prob, pred_logits, scale = predictor.predict(img)
     click.echo(f"[INFO] 模型预测区间: {len(model_intervals)} 个字符")
+    
+    click.echo(f"[DEBUG] 概率统计:")
+    click.echo(f"  概率平均值: {np.mean(pred_prob):.4f}")
+    click.echo(f"  概率最大值: {np.max(pred_prob):.4f}")
+    click.echo(f"  概率最小值: {np.min(pred_prob):.4f}")
+    click.echo(f"  大于阈值({threshold})的列数: {np.sum(pred_prob > threshold)}/{len(pred_prob)}")
+    click.echo(f"  大于0.5的列数: {np.sum(pred_prob > 0.5)}/{len(pred_prob)}")
+    click.echo(f"  缩放比例: {scale:.4f}")
+    click.echo(f"  原始宽度: {img.shape[1]}, 缩放后宽度: {len(pred_prob)}")
 
     save_dir_path = Path(save_dir) if save_dir else line_path.parent.parent / "visualization"
     save_path = save_dir_path / f"{line_path.stem}_comparison.png"

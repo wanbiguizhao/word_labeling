@@ -33,7 +33,7 @@ class CharSegmentPredictor:
         self.threshold = 0.5
         self.max_gap = 2
     
-    def predict(self, line_img: np.ndarray) -> Tuple[List[Tuple[int, int]], np.ndarray, float]:
+    def predict(self, line_img: np.ndarray) -> Tuple[List[Tuple[int, int]], np.ndarray, np.ndarray, float]:
         """
         预测行图像的字符区间
         
@@ -42,7 +42,8 @@ class CharSegmentPredictor:
         
         Returns:
             intervals_orig: [(start_col, end_col), ...] - 原始图像坐标
-            pred_prob: 预测概率数组（缩放后尺寸）
+            pred_prob: sigmoid后概率数组（缩放后尺寸），用于区间提取
+            pred_logits: 原始logits数组（缩放后尺寸），用于可视化
             scale: 缩放比例
         """
         original_w = line_img.shape[1]
@@ -60,7 +61,14 @@ class CharSegmentPredictor:
         
         with torch.no_grad():
             output = self.model(features_tensor)
+            pred_logits = output.squeeze().cpu().numpy()[:width]
             pred_prob = torch.sigmoid(output).squeeze().cpu().numpy()[:width]
+        
+        print(f"[DEBUG predict] 原始宽: {original_w}, 缩放后宽: {width}, scale: {scale:.4f}")
+        print(f"[DEBUG predict] pred_prob 形状: {pred_prob.shape}")
+        print(f"[DEBUG predict] pred_prob 统计: mean={pred_prob.mean():.4f}, max={pred_prob.max():.4f}, min={pred_prob.min():.4f}")
+        print(f"[DEBUG predict] >threshold({self.threshold}): {np.sum(pred_prob > self.threshold)}/{len(pred_prob)}")
+        print(f"[DEBUG predict] >0.5: {np.sum(pred_prob > 0.5)}/{len(pred_prob)}")
         
         intervals = IntervalExtractor.extract(pred_prob, self.threshold, self.max_gap)
         
@@ -70,9 +78,9 @@ class CharSegmentPredictor:
             for start, end in intervals
         ]
         
-        return intervals_orig, pred_prob, scale
+        return intervals_orig, pred_prob, pred_logits, scale
     
-    def predict_from_path(self, line_path: Path) -> Optional[Tuple[List[Tuple[int, int]], np.ndarray, float]]:
+    def predict_from_path(self, line_path: Path) -> Optional[Tuple[List[Tuple[int, int]], np.ndarray, np.ndarray, float]]:
         """
         从文件路径预测
         
@@ -80,7 +88,7 @@ class CharSegmentPredictor:
             line_path: 行图像路径
         
         Returns:
-            (intervals, pred_prob, scale) 或 None
+            (intervals, pred_prob, pred_logits, scale) 或 None
         """
         if not line_path.exists():
             return None
@@ -94,12 +102,12 @@ class CharSegmentPredictor:
     def draw_boundaries_with_prob(self, line_img: np.ndarray, intervals: List[Tuple[int, int]], 
                                    pred_prob: np.ndarray, scale: float, save_path: Path):
         """
-        绘制字符边界 + 概率可视化
+        绘制字符边界 + 概率可视化（使用sigmoid后的真实概率值，无阈值截断）
         
         Args:
             line_img: 原始灰度图像 (H × W)
             intervals: 字符区间列表 [(start_col, end_col), ...]
-            pred_prob: 预测概率数组
+            pred_prob: sigmoid后的概率数组（0-1之间，用于可视化）
             scale: 缩放比例
             save_path: 保存路径
         """
@@ -124,13 +132,16 @@ class CharSegmentPredictor:
             orig_col = int(round(resized_col * inv_scale))
             
             if 0 <= orig_col < W:
-                prob_percent = prob * 100
-                bar_height = math.ceil(prob_percent * 0.5)
+                bar_height = max(1, int(round(prob * self.prob_max_pixel)))
                 
-                if bar_height > 0:
-                    y_start = H + self.prob_height - bar_height
-                    y_end = H + self.prob_height
-                    draw.line([(orig_col, y_start), (orig_col, y_end)], fill=(255, 255, 0), width=1)
+                y_start = H + self.prob_height - bar_height
+                y_end = H + self.prob_height
+                
+                r = int(255 * prob)
+                g = int(255 * (1 - prob))
+                b = int(255 * (1 - prob))
+                
+                draw.line([(orig_col, y_start), (orig_col, y_end)], fill=(r, g, b), width=1)
         
         draw.line([(0, H), (W, H)], fill=(255, 0, 0), width=1)
         
@@ -154,7 +165,7 @@ class CharSegmentPredictor:
             print(f"[ERROR] 无法读取图像: {line_img_path}")
             return [], np.array([])
         
-        intervals, pred_prob, scale = result
+        intervals, pred_prob, pred_logits, scale = result
         
         if save_path is not None:
             img = cv2.imread(str(line_img_path), cv2.IMREAD_GRAYSCALE)
