@@ -271,11 +271,10 @@ def draw_comparison(
     for col in range(W):
         prob = prob_map[col]
         bar_height = max(1, int(round(prob * PROB_MAX_PIXEL)))
-        print(prob,bar_height)
         y_start = total_height - bar_height
         y_end = total_height
         
-        r = int(255 )
+        r = int(255 * prob)
         g = int(0)
         b = int(0)
         

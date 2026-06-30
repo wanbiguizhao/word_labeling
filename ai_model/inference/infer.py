@@ -64,12 +64,6 @@ class CharSegmentPredictor:
             pred_logits = output.squeeze().cpu().numpy()[:width]
             pred_prob = torch.sigmoid(output).squeeze().cpu().numpy()[:width]
         
-        print(f"[DEBUG predict] 原始宽: {original_w}, 缩放后宽: {width}, scale: {scale:.4f}")
-        print(f"[DEBUG predict] pred_prob 形状: {pred_prob.shape}")
-        print(f"[DEBUG predict] pred_prob 统计: mean={pred_prob.mean():.4f}, max={pred_prob.max():.4f}, min={pred_prob.min():.4f}")
-        print(f"[DEBUG predict] >threshold({self.threshold}): {np.sum(pred_prob > self.threshold)}/{len(pred_prob)}")
-        print(f"[DEBUG predict] >0.5: {np.sum(pred_prob > 0.5)}/{len(pred_prob)}")
-        
         intervals = IntervalExtractor.extract(pred_prob, self.threshold, self.max_gap)
         
         inv_scale = 1.0 / scale if scale > 0 else 1.0
