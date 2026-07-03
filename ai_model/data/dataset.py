@@ -248,12 +248,14 @@ class CharSegmentDataset(Dataset):
         self, 
         data_base_path: Path, 
         line_ids: List[str],
-        char_width_stats: Optional[Dict] = None
+        char_width_stats: Optional[Dict] = None,
+        annotations: Optional[Dict[str, dict]] = None
     ):
         self.data_base_path = data_base_path
         self.line_ids = line_ids
         self.lines_dir = data_base_path / "lines"
         self.rule_jsons_dir = data_base_path / "rule_jsons"
+        self._annotations = annotations
         
         # 预加载所有 rule_json 到内存缓存，避免每个 epoch 重复读取
         self._rule_cache: Dict[str, dict] = {}
@@ -270,14 +272,23 @@ class CharSegmentDataset(Dataset):
             self._compute_char_widths()
     
     def _load_rule_cache(self):
-        """批量加载所有 rule_json 到内存"""
-        for line_id in self.line_ids:
-            json_path = self.rule_jsons_dir / f"{line_id}_rule.json"
-            try:
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    self._rule_cache[line_id] = json.load(f)
-            except Exception:
-                pass
+        """批量加载所有 rule_json 到内存（支持从合并标注文件）"""
+        if self._annotations is not None:
+            for line_id in self.line_ids:
+                if line_id in self._annotations:
+                    ann = self._annotations[line_id]
+                    self._rule_cache[line_id] = {
+                        'chars': ann.get('chars', []),
+                        'image_height': ann.get('image_height', 0)
+                    }
+        else:
+            for line_id in self.line_ids:
+                json_path = self.rule_jsons_dir / f"{line_id}_rule.json"
+                try:
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        self._rule_cache[line_id] = json.load(f)
+                except Exception:
+                    pass
     
     def _load_char_width_stats(self, char_width_stats: Dict):
         """从外部传入的统计信息加载字符宽度"""
@@ -324,19 +335,38 @@ class CharSegmentDataset(Dataset):
     def __getitem__(self, idx):
         line_id = self.line_ids[idx]
         
-        line_path = self.lines_dir / f"{line_id}.png"
+        if self._annotations is not None and line_id in self._annotations:
+            image_path_str = self._annotations[line_id].get('image_path', '')
+            line_path = Path(image_path_str)
+            if not line_path.is_absolute():
+                line_path = self.data_base_path.parent / image_path_str.replace('\\', '/')
+        else:
+            line_path = self.lines_dir / f"{line_id}.png"
+        
         img = cv2.imread(str(line_path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"无法读取图像: {line_path}")
         
         rule_data = self._rule_cache.get(line_id)
         if rule_data is None:
-            json_path = self.rule_jsons_dir / f"{line_id}_rule.json"
-            with open(json_path, 'r', encoding='utf-8') as f:
-                rule_data = json.load(f)
+            if self._annotations is not None and line_id in self._annotations:
+                ann = self._annotations[line_id]
+                rule_data = {
+                    'chars': ann.get('chars', []),
+                    'image_height': ann.get('image_height', img.shape[0])
+                }
+            else:
+                json_path = self.rule_jsons_dir / f"{line_id}_rule.json"
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    rule_data = json.load(f)
         
         features, resized_w, scale = FeatureExtractor.extract(img)
         
-        # 使用合并后的标签（与 postprocess_merge_chars 一致）
-        image_height = int(rule_data.get('image_height', img.shape[0]) * scale)
+        image_height = rule_data.get('image_height', 0)
+        if image_height <= 0:
+            image_height = img.shape[0]
+        image_height = int(image_height * scale)
+        
         label = LabelGenerator.generate(
             rule_data['chars'], 
             resized_w, 

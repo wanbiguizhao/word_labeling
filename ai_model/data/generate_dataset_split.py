@@ -21,19 +21,27 @@ def load_all_line_ids(data_base_path: Path) -> List[str]:
     return line_ids
 
 
-def get_line_width(data_base_path: Path, line_id: str) -> int:
-    line_path = data_base_path / "lines" / f"{line_id}.png"
+def get_line_width(data_base_path: Path, line_id: str, annotations: Optional[Dict[str, dict]] = None) -> int:
+    if annotations is not None and line_id in annotations:
+        image_path_str = annotations[line_id].get('image_path', '')
+        line_path = Path(image_path_str)
+        if not line_path.is_absolute():
+            line_path = data_base_path.parent / image_path_str.replace('\\', '/')
+    else:
+        line_path = data_base_path / "lines" / f"{line_id}.png"
+    
     img = cv2.imread(str(line_path), cv2.IMREAD_GRAYSCALE)
     return img.shape[1] if img is not None else 0
 
 
-def compute_char_width_stats(data_base_path: Path, line_ids: List[str]) -> Dict:
+def compute_char_width_stats(data_base_path: Path, line_ids: List[str], annotations: Optional[Dict[str, dict]] = None) -> Dict:
     """
     计算字符宽度统计信息
     
     Args:
         data_base_path: 数据基础目录
         line_ids: 行ID列表
+        annotations: 合并标注字典（line_id -> annotation），可选
     
     Returns:
         字符宽度统计信息
@@ -43,26 +51,29 @@ def compute_char_width_stats(data_base_path: Path, line_ids: List[str]) -> Dict:
     line_char_widths = {}
     
     for line_id in line_ids:
-        json_path = rule_jsons_dir / f"{line_id}_rule.json"
-        if not json_path.exists():
-            continue
+        chars = []
         
-        try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                rule_data = json.load(f)
-            
-            chars = rule_data.get('chars', [])
-            widths = []
-            for char in chars:
-                w = char.get('width', 0)
-                if 3 <= w <= 100:
-                    widths.append(w)
-            
-            if widths:
-                line_char_widths[line_id] = float(np.median(widths))
-                all_char_widths.extend(widths)
-        except Exception:
-            pass
+        if annotations is not None and line_id in annotations:
+            chars = annotations[line_id].get('chars', [])
+        else:
+            json_path = rule_jsons_dir / f"{line_id}_rule.json"
+            if json_path.exists():
+                try:
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        rule_data = json.load(f)
+                    chars = rule_data.get('chars', [])
+                except Exception:
+                    pass
+        
+        widths = []
+        for char in chars:
+            w = char.get('width', 0)
+            if 3 <= w <= 100:
+                widths.append(w)
+        
+        if widths:
+            line_char_widths[line_id] = float(np.median(widths))
+            all_char_widths.extend(widths)
     
     stats = {
         'total_chars': len(all_char_widths),
@@ -81,15 +92,18 @@ def generate_dataset_split(
     output_path: Path,
     train_ratio: float = 0.8,
     seed: int = 42,
-    sort_by_width: bool = False
+    sort_by_width: bool = False,
+    annotations: Optional[Dict[str, dict]] = None
 ) -> Dict:
-    line_ids = load_all_line_ids(data_base_path)
+    if annotations is not None:
+        line_ids = list(annotations.keys())
+    else:
+        line_ids = load_all_line_ids(data_base_path)
     
-    # 计算字符宽度统计
-    char_width_stats = compute_char_width_stats(data_base_path, line_ids)
+    char_width_stats = compute_char_width_stats(data_base_path, line_ids, annotations)
     
     if sort_by_width:
-        line_ids_with_width = [(line_id, get_line_width(data_base_path, line_id)) 
+        line_ids_with_width = [(line_id, get_line_width(data_base_path, line_id, annotations)) 
                                for line_id in line_ids]
         line_ids_with_width.sort(key=lambda x: x[1])
         line_ids = [x[0] for x in line_ids_with_width]
@@ -102,8 +116,8 @@ def generate_dataset_split(
     train_ids = shuffled_ids[:split_idx]
     val_ids = shuffled_ids[split_idx:]
     
-    train_widths = [get_line_width(data_base_path, line_id) for line_id in train_ids]
-    val_widths = [get_line_width(data_base_path, line_id) for line_id in val_ids]
+    train_widths = [get_line_width(data_base_path, line_id, annotations) for line_id in train_ids]
+    val_widths = [get_line_width(data_base_path, line_id, annotations) for line_id in val_ids]
     
     split_info = {
         "version": "1.1",

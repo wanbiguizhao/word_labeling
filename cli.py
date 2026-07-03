@@ -73,7 +73,7 @@ def train():
     """训练深度学习分割模型"""
 
 
-@train.command("start")
+@train.command("pretrain")
 @click.option("--batch-size", type=int, default=8, show_default=True, help="批大小")
 @click.option("--lr", "learning_rate", type=float, default=1e-4, show_default=True, help="学习率")
 @click.option("--epochs", "num_epochs", type=int, default=50, show_default=True, help="训练轮数")
@@ -88,12 +88,12 @@ def train():
 @click.option("--split-file", type=str, default="ai_model/data/dataset_split.json",
               show_default=True, help="数据集划分文件路径（相对项目根）")
 @click.option("--seed", type=int, default=42, show_default=True, help="随机种子")
-def train_start(batch_size, learning_rate, num_epochs, train_ratio,
-                device, num_workers, use_amp, checkpoint_dir,
-                data_base_path, split_file, seed):
-    """训练分割模型"""
+def train_pretrain(batch_size, learning_rate, num_epochs, train_ratio,
+                   device, num_workers, use_amp, checkpoint_dir,
+                   data_base_path, split_file, seed):
+    """预训练分割模型（使用 rule_jsons 数据）"""
     from ai_model.train.train_config import TrainConfig
-    from ai_model.train.train import main as train_main
+    from ai_model.train.pretrain import main as pretrain_main
 
     cfg = TrainConfig(
         batch_size=batch_size,
@@ -108,7 +108,56 @@ def train_start(batch_size, learning_rate, num_epochs, train_ratio,
         split_file=split_file,
         seed=seed
     )
-    train_main(cfg)
+    pretrain_main(cfg)
+
+
+@train.command("finetune")
+@click.option("--batch-size", type=int, default=8, show_default=True, help="批大小")
+@click.option("--epochs", "num_epochs", type=int, default=30, show_default=True, help="训练轮数")
+@click.option("--train-ratio", type=float, default=0.8, show_default=True, help="训练集比例")
+@click.option("--device", type=str, default="auto", show_default=True,
+              help='训练设备: "auto", "cuda", "cpu"')
+@click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader 并行数")
+@click.option("--use-amp/--no-amp", default=True, help="是否启用混合精度训练")
+@click.option("--checkpoint-dir", type=str, default="models", show_default=True, help="模型保存目录")
+@click.option("--data-base-path", type=str, default="datahome", show_default=True,
+              help="数据基础目录（相对项目根）")
+@click.option("--dataset", type=str, default=None,
+              help="合并标注文件路径（如 datahome/datasets/merged_annotations.json）")
+@click.option("--split-file", type=str, default="ai_model/data/dataset_split.json",
+              show_default=True, help="数据集划分文件路径（相对项目根）")
+@click.option("--seed", type=int, default=42, show_default=True, help="随机种子")
+@click.option("--pretrained-model", type=str, default=None,
+              help="预训练模型路径，用于微调（如 models/char_segment_1d_unet_best.pth）")
+@click.option("--freeze-layers/--no-freeze-layers", default=False,
+              help="是否冻结编码器层，只训练解码器（微调时使用）")
+@click.option("--fine-tune-lr", type=float, default=1e-5, show_default=True,
+              help="微调时使用的学习率")
+def train_finetune(batch_size, num_epochs, train_ratio,
+                   device, num_workers, use_amp, checkpoint_dir,
+                   data_base_path, dataset, split_file, seed,
+                   pretrained_model, freeze_layers, fine_tune_lr):
+    """微调分割模型（使用合并标注数据）"""
+    from ai_model.train.train_config import FineTuneConfig
+    from ai_model.train.finetune import main as finetune_main
+
+    cfg = FineTuneConfig(
+        batch_size=batch_size,
+        num_epochs=num_epochs,
+        train_ratio=train_ratio,
+        device=device,
+        num_workers=num_workers,
+        use_amp=use_amp,
+        checkpoint_dir=checkpoint_dir,
+        data_base_path=data_base_path,
+        annotations_file=dataset,
+        split_file=split_file,
+        seed=seed,
+        pretrained_model_path=pretrained_model,
+        freeze_layers=freeze_layers,
+        fine_tune_lr=fine_tune_lr
+    )
+    finetune_main(cfg)
 
 
 @train.command("split-dataset")
@@ -117,21 +166,34 @@ def train_start(batch_size, learning_rate, num_epochs, train_ratio,
 @click.option("--sort-by-width", is_flag=True, help="按宽度排序后划分")
 @click.option("--data-base-path", type=str, default="datahome", show_default=True,
               help="数据基础目录（相对项目根）")
+@click.option("--dataset", type=str, default=None,
+              help="合并标注文件路径（如 datahome/datasets/merged_annotations.json）")
 @click.option("--output", type=str, default="ai_model/data/dataset_split.json",
               show_default=True, help="划分文件输出路径（相对项目根）")
-def train_split_dataset(train_ratio, seed, sort_by_width, data_base_path, output):
+def train_split_dataset(train_ratio, seed, sort_by_width, data_base_path, dataset, output):
     """生成数据集划分文件"""
     from ai_model.data.generate_dataset_split import generate_dataset_split
+    import json
 
     data_path = BASE_DIR / data_base_path
     output_path = BASE_DIR / output
+
+    annotations = None
+    if dataset:
+        annotations_path = BASE_DIR / dataset
+        click.echo(f"[INFO] 加载合并标注文件: {annotations_path}")
+        with open(annotations_path, 'r', encoding='utf-8') as f:
+            annotations_list = json.load(f)
+        annotations = {item['line_id']: item for item in annotations_list}
+        click.echo(f"[INFO] 合并标注文件包含 {len(annotations)} 条记录")
 
     split_info = generate_dataset_split(
         data_base_path=data_path,
         output_path=output_path,
         train_ratio=train_ratio,
         seed=seed,
-        sort_by_width=sort_by_width
+        sort_by_width=sort_by_width,
+        annotations=annotations
     )
 
     click.echo(f"[INFO] 数据集划分完成!")

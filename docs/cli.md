@@ -27,7 +27,8 @@ cli.py
 │   ├── single       # 处理单个 PDF 文件
 │   └── batch        # 批量处理 PDF 文件
 ├── train            # 训练深度学习分割模型
-│   ├── start                # 启动模型训练
+│   ├── pretrain             # 预训练分割模型（使用 rule_jsons 数据）
+│   ├── finetune             # 微调分割模型（使用合并标注数据）
 │   ├── split-dataset        # 生成数据集划分文件
 │   ├── active-learn         # 主动学习（基于模型）：找出最需标注的行
 │   └── rule-based-al        # 主动学习（基于规则）：仅用规则识别可能切割错误的样本
@@ -97,10 +98,12 @@ python cli.py segment batch --data-base-path /path/to/datahome
 
 ## 2. 模型训练 (train)
 
-### train start — 启动训练
+### train pretrain — 预训练分割模型
+
+使用 `rule_jsons` 目录下的规则切割数据进行预训练，适用于初始模型训练。
 
 ```bash
-python cli.py train start [options]
+python cli.py train pretrain [options]
 ```
 
 **参数：**
@@ -122,16 +125,65 @@ python cli.py train start [options]
 **示例：**
 
 ```bash
-# 默认配置训练
-python cli.py train start
+# 默认配置预训练
+python cli.py train pretrain
 
 # 自定义配置
-python cli.py train start --batch-size 64 --lr 1e-4 --epochs 100 \
+python cli.py train pretrain --batch-size 16 --lr 1e-4 --epochs 50 \
     --device cuda --num-workers 8
 
 # 关闭 AMP
-python cli.py train start --no-amp
+python cli.py train pretrain --no-amp
 ```
+
+---
+
+### train finetune — 微调分割模型
+
+使用精细标注的合并标注数据（`merged_annotations.json`）进行微调，适用于在预训练模型基础上进一步优化。
+
+```bash
+python cli.py train finetune [options]
+```
+
+**参数：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--batch-size` | int | 8 | 批大小 |
+| `--epochs` | int | 30 | 训练轮数（微调通常较少） |
+| `--train-ratio` | float | 0.8 | 训练集比例 |
+| `--device` | str | auto | 训练设备 (auto/cuda/cpu) |
+| `--num-workers` | int | 4 | DataLoader 并行数 |
+| `--use-amp`/`--no-amp` | flag | True | 是否启用混合精度训练 |
+| `--checkpoint-dir` | str | models | 模型保存目录 |
+| `--data-base-path` | str | datahome | 数据基础目录（相对项目根） |
+| `--dataset` | str | — | 合并标注文件路径（如 `datahome/datasets/merged_annotations.json`） |
+| `--split-file` | str | ai_model/data/dataset_split.json | 数据集划分文件路径 |
+| `--seed` | int | 42 | 随机种子 |
+| `--pretrained-model` | str | — | 预训练模型路径（如 `models/char_segment_1d_unet_best.pth`） |
+| `--freeze-layers`/`--no-freeze-layers` | flag | False | 是否冻结编码器层，只训练解码器 |
+| `--fine-tune-lr` | float | 1e-5 | 微调时使用的学习率（通常比预训练小） |
+
+**示例：**
+
+```bash
+# 使用合并标注数据微调（从预训练模型开始）
+python cli.py train finetune --dataset datahome/datasets/merged_annotations.json \
+    --pretrained-model models/char_segment_1d_unet_best.pth \
+    --epochs 30 --fine-tune-lr 1e-5
+
+# 冻结编码器层，只训练解码器
+python cli.py train finetune --dataset datahome/datasets/merged_annotations.json \
+    --pretrained-model models/char_segment_1d_unet_best.pth \
+    --freeze-layers --epochs 20
+
+# 使用更小的批大小和学习率
+python cli.py train finetune --dataset datahome/datasets/merged_annotations.json \
+    --batch-size 4 --fine-tune-lr 5e-6 --epochs 40
+```
+
+---
 
 **训练输出指标：**
 
@@ -157,6 +209,19 @@ Epoch [10/50] | LR=1.00e-04
 
 ---
 
+**预训练 vs 微调对比：**
+
+| 特性 | 预训练 (`pretrain`) | 微调 (`finetune`) |
+|------|---------------------|-------------------|
+| 数据源 | `rule_jsons` 规则切割结果 | `merged_annotations.json` 精细标注 |
+| 数据量 | 大规模（所有规则切割数据） | 小规模（人工精细标注） |
+| 学习率 | 较大（1e-4） | 较小（1e-5） |
+| 轮数 | 较多（50+） | 较少（20-30） |
+| 预训练模型 | 不需要 | 需要（可选） |
+| 冻结层 | 不支持 | 支持（仅训练解码器） |
+
+---
+
 ### train split-dataset — 生成数据集划分
 
 ```bash
@@ -171,12 +236,18 @@ python cli.py train split-dataset [options]
 | `--seed` | int | 42 | 随机种子 |
 | `--sort-by-width` | flag | — | 按宽度排序后划分（减少 padding 浪费） |
 | `--data-base-path` | str | datahome | 数据基础目录（相对项目根） |
+| `--dataset` | str | — | 合并标注文件路径（如 `datahome/datasets/merged_annotations.json`），指定后使用合并标注数据划分 |
 | `--output` | str | ai_model/data/dataset_split.json | 输出文件路径 |
 
 **示例：**
 
 ```bash
+# 使用 rule_jsons 数据划分（默认）
 python cli.py train split-dataset --train-ratio 0.9 --sort-by-width
+
+# 使用合并标注数据划分（用于微调）
+python cli.py train split-dataset --dataset datahome/datasets/merged_annotations.json \
+    --train-ratio 0.8
 ```
 
 **输出说明：**
@@ -415,8 +486,12 @@ python cli.py predict compare dummy \
 python image_tools/segment_manager.py single <pdf_name>
 python image_tools/segment_manager.py batch --start 0 --end 10
 
-# 模型训练
-python ai_model/train/train.py start --batch-size 64 --epochs 100
+# 模型训练（预训练）
+python ai_model/train/pretrain.py --batch-size 64 --epochs 50
+
+# 模型训练（微调）
+python ai_model/train/finetune.py --dataset datahome/datasets/merged_annotations.json \
+    --pretrained-model models/char_segment_1d_unet_best.pth --epochs 30
 
 # 数据集划分
 python ai_model/data/generate_dataset_split.py split-dataset --train-ratio 0.8

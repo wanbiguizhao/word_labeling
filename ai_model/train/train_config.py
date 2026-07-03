@@ -39,3 +39,14 @@ class TrainConfig:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         if self.device == "cpu":
             self.use_amp = False
+
+
+@dataclass
+class FineTuneConfig(TrainConfig):
+    annotations_file: Optional[str] = None
+    
+    pretrained_model_path: Optional[str] = None
+    
+    freeze_layers: bool = False
+    
+    fine_tune_lr: float = 1e-5

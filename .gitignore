@@ -61,3 +61,5 @@ torch_cache/
 ai_model/data/dataset_split.json
 ai_model/models/al_ranking.json
 ai_model/models/rule_based_al_ranking.json
+cutting_labeling_system/*
+cutting_labeling_system
