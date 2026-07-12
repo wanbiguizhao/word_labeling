@@ -105,37 +105,44 @@ def load_lineage_intervals(lineage_path: Path, line_id: str) -> List[Tuple[int, 
     return intervals
 
 
-def compute_prob_map(pred_prob: np.ndarray, orig_width: int, scale: float) -> Tuple[np.ndarray, np.ndarray]:
+def compute_prob_map(pred_prob: np.ndarray, orig_width: int, scale: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     将模型概率映射回原始图像宽度（用于可视化，无阈值截断）
 
     Args:
-        pred_prob: sigmoid后的概率数组（0-1之间，缩放后宽度）
+        pred_prob: softmax后的概率数组（3通道：[空白概率, 边界概率, 内部概率]）
         orig_width: 原始图像宽度
         scale: 缩放比例
 
     Returns:
-        (prob_map, bar_heights) 映射到原始宽度的概率和条高度
+        (prob_map, boundary_prob_map, bar_heights) 
+            字符概率图、边界概率图、条高度
     """
     inv_scale = 1.0 / scale if scale > 0 else 1.0
-    resized_w = len(pred_prob)
+    n_channels, resized_w = pred_prob.shape
 
     prob_map = np.zeros(orig_width, dtype=np.float32)
+    boundary_prob_map = np.zeros(orig_width, dtype=np.float32)
     count_map = np.zeros(orig_width, dtype=np.int32)
 
     for resized_col in range(resized_w):
-        prob = pred_prob[resized_col]
+        char_prob = max(pred_prob[1, resized_col], pred_prob[2, resized_col])
+        boundary_prob = pred_prob[1, resized_col]
+        
         orig_col = int(round(resized_col * inv_scale))
         orig_col = min(max(orig_col, 0), orig_width - 1)
-        prob_map[orig_col] += prob
+        
+        prob_map[orig_col] += char_prob
+        boundary_prob_map[orig_col] += boundary_prob
         count_map[orig_col] += 1
 
     mask = count_map > 0
     prob_map[mask] /= count_map[mask]
+    boundary_prob_map[mask] /= count_map[mask]
 
     bar_heights = np.maximum(1, np.round(prob_map * PROB_MAX_PIXEL)).astype(np.int32)
 
-    return prob_map, bar_heights
+    return prob_map, boundary_prob_map, bar_heights
 
 
 def draw_comparison(
@@ -238,19 +245,20 @@ def draw_comparison(
     draw.line([(0, current_y), (W, current_y)], fill=SEP_LINE_COLOR, width=sep)
 
     # =====================================
-    # 最后行：概率热力图（使用sigmoid后的真实概率值，无阈值截断）
+    # 最后行：概率热力图（使用softmax后的真实概率值，无阈值截断）
     # =====================================
-    prob_map, bar_heights = compute_prob_map(pred_prob, W, scale)
+    prob_map, boundary_prob_map, bar_heights = compute_prob_map(pred_prob, W, scale)
 
     for col in range(W):
         prob = prob_map[col]
+        boundary_prob = boundary_prob_map[col]
         bar_height = max(1, int(round(prob * PROB_MAX_PIXEL)))
         y_start = total_height - bar_height
         y_end = total_height
         
         r = int(255 * prob)
-        g = int(0)
-        b = int(0)
+        g = int(255 * boundary_prob)
+        b = int(255 * (1 - prob))
         
         draw.line([(col, y_start), (col, y_end)], fill=(r, g, b), width=1)
 
@@ -348,13 +356,11 @@ def cli(line_id, data_base_path, model_path, image_path, rule_json_path, save_di
     click.echo(f"[INFO] 模型预测区间: {len(model_intervals)} 个字符")
     
     click.echo(f"[DEBUG] 概率统计:")
-    click.echo(f"  概率平均值: {np.mean(pred_prob):.4f}")
-    click.echo(f"  概率最大值: {np.max(pred_prob):.4f}")
-    click.echo(f"  概率最小值: {np.min(pred_prob):.4f}")
-    click.echo(f"  大于阈值({threshold})的列数: {np.sum(pred_prob > threshold)}/{len(pred_prob)}")
-    click.echo(f"  大于0.5的列数: {np.sum(pred_prob > 0.5)}/{len(pred_prob)}")
+    click.echo(f"  空白类平均概率: {np.mean(pred_prob[0]):.4f}")
+    click.echo(f"  边界类平均概率: {np.mean(pred_prob[1]):.4f}")
+    click.echo(f"  内部类平均概率: {np.mean(pred_prob[2]):.4f}")
     click.echo(f"  缩放比例: {scale:.4f}")
-    click.echo(f"  原始宽度: {img.shape[1]}, 缩放后宽度: {len(pred_prob)}")
+    click.echo(f"  原始宽度: {img.shape[1]}, 缩放后宽度: {pred_prob.shape[1]}")
 
     save_dir_path = Path(save_dir) if save_dir else line_path.parent.parent / "visualization"
     save_path = save_dir_path / f"{line_path.stem}_comparison.png"
@@ -370,7 +376,7 @@ def cli(line_id, data_base_path, model_path, image_path, rule_json_path, save_di
         if rule_intervals:
             click.echo(f"  （较原始减少 {len(rule_intervals) - len(rule_intervals_merged)} 个）")
     click.echo(f"  模型预测: {len(model_intervals)} 字符")
-    click.echo(f"  概率平均值: {np.mean(pred_prob):.4f}")
+    click.echo(f"  字符类平均概率: {np.mean(pred_prob[1:]):.4f}")
 
 
 if __name__ == "__main__":

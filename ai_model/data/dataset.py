@@ -89,7 +89,17 @@ class LabelGenerator:
         merge_enabled: bool = True
     ) -> np.ndarray:
         """
-        从字符段生成标签数组
+        从字符段生成3类序列标签数组
+        
+        标签定义：
+            0 = 空白区域（字符外部）
+            1 = 边界（字符的起始列和结束列）
+            2 = 字符内部（非边界的字符区域）
+        
+        特殊情况处理：
+            - 宽度=1的字符：整列标为边界（1）
+            - 宽度=2的字符：两列都标为边界（[1, 1]）
+            - 宽度≥3的字符：首尾列标边界，中间列标内部（[1, 2, ..., 2, 1]）
         
         Args:
             char_segments: 字符段列表，每个包含 col_start, col_end, width, height
@@ -99,9 +109,9 @@ class LabelGenerator:
             merge_enabled: 是否启用合并逻辑（与 postprocess_merge_chars 一致）
         
         Returns:
-            label: 二值标签数组，字符区域为1.0，间隙为0.0
+            label: 3类序列标签数组，值为0/1/2
         """
-        label = np.zeros(image_width, dtype=np.float32)
+        label = np.zeros(image_width, dtype=np.int64)
         
         if not char_segments:
             return label
@@ -115,7 +125,7 @@ class LabelGenerator:
             end = max(0, min(end, image_width - 1))
             intervals.append((start, end))
         
-        # 执行合并逻辑
+        # 执行合并逻辑（清洗多切噪声）
         if merge_enabled and len(intervals) >= 2:
             intervals = LabelGenerator._merge_narrow_chars(
                 intervals, image_height,
@@ -126,12 +136,58 @@ class LabelGenerator:
                 max_ratio=MERGE_MAX_ASPECT_RATIO
             )
         
-        # 生成标签
+        # 生成3类序列标签
         for start, end in intervals:
-            if end >= start:
-                label[start:end+1] = 1.0
+            if end < start:
+                continue
+            
+            char_width = end - start + 1
+            
+            if char_width == 1:
+                label[start] = 1
+            elif char_width == 2:
+                label[start] = 1
+                label[end] = 1
+            else:
+                label[start] = 1
+                label[end] = 1
+                if start + 1 <= end - 1:
+                    label[start + 1:end] = 2
         
         return label
+    
+    @staticmethod
+    def visualize_label(label: np.ndarray, save_path: str = None) -> None:
+        """
+        可视化3类序列标签，用于调试检查
+        
+        Args:
+            label: 3类序列标签数组（0=空白, 1=边界, 2=内部）
+            save_path: 保存路径，None则显示（需要matplotlib）
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        
+        cmap = mcolors.ListedColormap(['white', 'red', 'blue'])
+        bounds = [0, 0.5, 1.5, 2.5]
+        norm = mcolors.BoundaryNorm(bounds, cmap.N)
+        
+        fig, ax = plt.subplots(figsize=(10, 2))
+        ax.imshow(label.reshape(1, -1), cmap=cmap, norm=norm, aspect='auto')
+        
+        ax.set_yticks([])
+        ax.set_xlabel('Column')
+        ax.set_title('Sequence Label Visualization (0=white, 1=red, 2=blue)')
+        
+        cbar = plt.colorbar(ax.imshow(label.reshape(1, -1), cmap=cmap, norm=norm, aspect='auto'), 
+                           ax=ax, ticks=[0.25, 1.0, 1.75])
+        cbar.ax.set_yticklabels(['0 (空白)', '1 (边界)', '2 (内部)'])
+        
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight', dpi=150)
+            print(f"标签可视化已保存: {save_path}")
+        else:
+            plt.show()
     
     @staticmethod
     def _merge_narrow_chars(

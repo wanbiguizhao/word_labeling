@@ -10,10 +10,10 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from ai_model.models.unet1d import UNet1D, DiceBCELoss
+from ai_model.models.unet1d import UNet1D
 from ai_model.data.dataset import CharSegmentDataset, collate_fn, load_all_line_ids
 from ai_model.train.train_config import TrainConfig
-from ai_model.train.train_common import train_model, evaluate_model, save_model_and_history, setup_scheduler
+from ai_model.train.train_common import train_model, evaluate_model, save_model_and_history, setup_scheduler, FocalLoss
 
 
 def load_dataset_split(config: TrainConfig):
@@ -102,9 +102,9 @@ def main(config: TrainConfig = None):
     device_type = "cuda" if "cuda" in str(device) else "cpu"
     print(f"[INFO] 使用设备: {device}")
     
-    model = UNet1D(n_channels=6, n_classes=1).to(device)
+    model = UNet1D(n_channels=6, n_classes=3).to(device)
     
-    criterion = DiceBCELoss()
+    criterion = FocalLoss(gamma=2.0)
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
     scheduler = setup_scheduler(
         optimizer,
