@@ -42,70 +42,7 @@ PROB_HEIGHT = 51                   # 概率图高度（像素）
 PROB_MAX_PIXEL = 50                # 概率条最大高度
 
 
-# ===================== 合并后处理默认参数 =====================
-DEFAULT_MERGE_MIN_GAP = 3          # 最小间隙（与 segment_config.py 保持一致）
-DEFAULT_MERGE_SINGLE_RATIO = 0.7   # 单字符宽高比上限
-DEFAULT_MERGE_MIN_RATIO = 0.5      # 合并后宽高比下限
-DEFAULT_MERGE_MAX_RATIO = 1.5      # 合并后宽高比上限
 
-
-# ===================== 合并后处理函数 =====================
-
-def merge_rule_intervals(
-    intervals: List[Tuple[int, int]],
-    image_height: int,
-    min_gap: int = DEFAULT_MERGE_MIN_GAP,
-    single_ratio: float = DEFAULT_MERGE_SINGLE_RATIO,
-    min_ratio: float = DEFAULT_MERGE_MIN_RATIO,
-    max_ratio: float = DEFAULT_MERGE_MAX_RATIO
-) -> List[Tuple[int, int]]:
-    """
-    模拟 postprocess_merge_chars 的合并逻辑
-
-    合并条件（全部满足才合并）：
-      1. 间隙 < min_gap
-      2. 两个字符都窄（width/height < single_ratio）
-      3. 合并后的宽高比在 [min_ratio, max_ratio] 范围内
-
-    Args:
-        intervals: [(start, end), ...] 按列排序的区间
-        image_height: 行图像高度（作为字符高度）
-        min_gap: 最小间隙像素数
-        single_ratio: 单字符宽高比上限
-        min_ratio: 合并后宽高比下限
-        max_ratio: 合并后宽高比上限
-
-    Returns:
-        合并后的区间列表
-    """
-    if len(intervals) < 2:
-        return intervals[:]
-
-    merged = [intervals[0]]
-
-    for current in intervals[1:]:
-        last = merged[-1]
-        gap = current[0] - last[1] - 1
-
-        if gap >= 0 and gap < min_gap:
-            w1 = last[1] - last[0]
-            w2 = current[1] - current[0]
-            r1 = w1 / image_height
-            r2 = w2 / image_height
-
-            # 条件2：两个字符都窄
-            if r1 < single_ratio and r2 < single_ratio:
-                merged_w = current[1] - last[0]
-                merged_r = merged_w / image_height
-
-                # 条件3：合并后比例合理
-                if min_ratio < merged_r < max_ratio:
-                    merged[-1] = (last[0], current[1])
-                    continue
-
-        merged.append(current)
-
-    return merged
 
 
 def load_rule_intervals(rule_json_path: Path) -> List[Tuple[int, int]]:
@@ -127,6 +64,43 @@ def load_rule_intervals(rule_json_path: Path) -> List[Tuple[int, int]]:
         end = char.get('col_end', 0)
         if end > start:
             intervals.append((start, end))
+
+    return intervals
+
+
+def load_lineage_intervals(lineage_path: Path, line_id: str) -> List[Tuple[int, int]]:
+    """
+    从 lineage.json 中读取后处理合并后的字符区间
+
+    Args:
+        lineage_path: lineage.json 文件路径
+        line_id: 行ID
+
+    Returns:
+        [(start, end), ...] 字符区间列表（已合并后的数据）
+    """
+    if not lineage_path.exists():
+        return []
+
+    with open(lineage_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    lines = data.get('lines', {})
+    chars = data.get('chars', {})
+
+    line_info = lines.get(line_id)
+    if not line_info:
+        return []
+
+    char_ids = line_info.get('chars', [])
+    intervals = []
+    for cid in char_ids:
+        char_info = chars.get(cid)
+        if char_info:
+            start = char_info.get('col_start', 0)
+            end = char_info.get('col_end', 0)
+            if end > start:
+                intervals.append((start, end))
 
     return intervals
 
@@ -303,33 +277,21 @@ def draw_comparison(
               help="可视化结果保存目录")
 @click.option("--max-gap", type=int, default=2, show_default=True,
               help="模型合并间隙（特征像素，设为 -1 禁用合并）")
-@click.option("--merge-min-gap", type=int, default=DEFAULT_MERGE_MIN_GAP,
-              show_default=True, help="规则后处理合并：最小间隙")
-@click.option("--merge-single-ratio", type=float, default=DEFAULT_MERGE_SINGLE_RATIO,
-              show_default=True, help="规则后处理合并：单字符宽高比上限")
-@click.option("--merge-min-ratio", type=float, default=DEFAULT_MERGE_MIN_RATIO,
-              show_default=True, help="规则后处理合并：合并后宽高比下限")
-@click.option("--merge-max-ratio", type=float, default=DEFAULT_MERGE_MAX_RATIO,
-              show_default=True, help="规则后处理合并：合并后宽高比上限")
 @click.option("--threshold", type=float, default=0.3, show_default=True,
               help="模型预测概率阈值")
 def cli(line_id, data_base_path, model_path, image_path, rule_json_path, save_dir,
-        max_gap, merge_min_gap, merge_single_ratio, merge_min_ratio, merge_max_ratio,
-        threshold):
+        max_gap, threshold):
     """
     对比规则与模型的切割结果
 
     生成多层对比可视化图：
     第1行：原始行图像
     第2行：规则切割结果（原始间隔）
-    第3行：规则切割结果（后处理合并后）
+    第3行：规则切割结果（后处理合并后，从 lineage.json 读取）
     第4行：模型预测结果
     第5行：模型概率热力图
 
-    规则后处理合并条件（与 segment_manager 一致）：
-    1. 两个字符间隙 < --merge-min-gap 像素
-    2. 两个字符都窄（width/height < --merge-single-ratio）
-    3. 合并后宽高比在 [--merge-min-ratio, --merge-max-ratio] 范围
+    规则后处理合并数据直接从 lineage.json 读取，不自行进行后处理操作。
     """
     # 确定文件路径
     if image_path:
@@ -353,31 +315,23 @@ def cli(line_id, data_base_path, model_path, image_path, rule_json_path, save_di
     if rule_json.exists():
         rule_intervals = load_rule_intervals(rule_json)
         click.echo(f"[INFO] 规则切割区间（合并前）: {len(rule_intervals)} 个字符")
-
-        # 读取行图像（用于合并计算和后续模型推理共用）
-        img = cv2.imread(str(line_path), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            click.echo(f"[ERROR] 无法读取图像: {line_path}", err=True)
-            sys.exit(1)
-
-        # 计算后处理合并后的区间
-        rule_intervals_merged = merge_rule_intervals(
-            rule_intervals,
-            image_height=img.shape[0],
-            min_gap=merge_min_gap,
-            single_ratio=merge_single_ratio,
-            min_ratio=merge_min_ratio,
-            max_ratio=merge_max_ratio
-        )
-        click.echo(f"[INFO] 规则切割区间（合并后）: {len(rule_intervals_merged)} 个字符"
-                   f"（合并了 {len(rule_intervals) - len(rule_intervals_merged)} 对）")
     else:
         click.echo(f"[WARN] 规则 JSON 不存在: {rule_json}")
-        # 没有规则JSON时仍需读取图像用于模型推理
-        img = cv2.imread(str(line_path), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            click.echo(f"[ERROR] 无法读取图像: {line_path}", err=True)
-            sys.exit(1)
+
+    # 从 lineage.json 读取后处理合并后的区间
+    data_path = Path(data_base_path) if data_base_path else BASE_DIR / "datahome"
+    lineage_path = data_path / "lineage.json"
+    rule_intervals_merged = load_lineage_intervals(lineage_path, line_id)
+    if rule_intervals_merged:
+        click.echo(f"[INFO] 规则切割区间（合并后，来自 lineage.json）: {len(rule_intervals_merged)} 个字符")
+    else:
+        click.echo(f"[WARN] lineage.json 中未找到 {line_id} 的后处理数据")
+
+    # 读取行图像（用于模型推理）
+    img = cv2.imread(str(line_path), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        click.echo(f"[ERROR] 无法读取图像: {line_path}", err=True)
+        sys.exit(1)
 
     # 加载模型
     model_file = Path(model_path) if model_path else BASE_DIR / "ai_model" / "models" / "char_segment_1d_unet_best.pth"
@@ -410,10 +364,11 @@ def cli(line_id, data_base_path, model_path, image_path, rule_json_path, save_di
     click.echo(f"\n{'='*50}")
     click.echo("切割对比统计")
     click.echo(f"{'='*50}")
-    click.echo(f"  规则切割（合并前）: {len(rule_intervals)} 字符")
+    click.echo(f"  规则切割（原始）: {len(rule_intervals)} 字符")
     if rule_intervals_merged:
-        click.echo(f"  规则切割（合并后）: {len(rule_intervals_merged)} 字符"
-                   f"（合并 {len(rule_intervals) - len(rule_intervals_merged)} 对）")
+        click.echo(f"  规则切割（后处理，来自 lineage.json）: {len(rule_intervals_merged)} 字符")
+        if rule_intervals:
+            click.echo(f"  （较原始减少 {len(rule_intervals) - len(rule_intervals_merged)} 个）")
     click.echo(f"  模型预测: {len(model_intervals)} 字符")
     click.echo(f"  概率平均值: {np.mean(pred_prob):.4f}")
 

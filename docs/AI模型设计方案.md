@@ -7,6 +7,7 @@
 | v1.0 | 2026-06-26 | System | 初始版本，1D U-Net模型设计 |
 | v1.1 | 2026-06-28 | System | 文档修正：标签生成已使用后处理合并逻辑，引用实际代码实现 |
 | v1.2 | 2026-06-29 | System | 新增ROI-IOU和拆分IOU指标；字符宽度自动计算；数据集预计算优化 |
+| v1.3 | 2026-07-10 | System | 同步代码结构：预训练/微调拆分、共享训练逻辑、主动学习模块 |
 
 ---
 
@@ -475,7 +476,7 @@ def compute_char_width_stats(data_base_path, line_ids):
 ```
 generate_dataset_split.py（预计算）→ dataset_split.json（存储）
        ↓
-train.py（读取）→ CharSegmentDataset（加载）→ 评估指标（使用）
+pretrain.py / finetune.py（读取）→ CharSegmentDataset（加载）→ 评估指标（使用）
 ```
 
 ---
@@ -522,10 +523,12 @@ train.py（读取）→ CharSegmentDataset（加载）→ 评估指标（使用�
 
 ### 7.3 训练脚本
 
-```python
-# ai_model/train/train.py
+训练逻辑已按预训练/微调分离重构，共享逻辑位于 `train_common.py`：
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, device, num_epochs=50):
+```python
+# ai_model/train/train_common.py — 共享训练循环
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, device, ...):
     best_val_loss = float('inf')
     
     for epoch in range(num_epochs):
@@ -552,6 +555,15 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, device, n
         if val_loss < best_val_loss:
             torch.save(model.state_dict(), 'char_segment_1d_unet_best.pth')
 ```
+
+**预训练 vs 微调入口：**
+
+| 入口 | 文件 | 数据源 | 说明 |
+|------|------|--------|------|
+| 预训练 | `ai_model/train/pretrain.py` | `rule_jsons` 规则切割结果 | 使用 `TrainConfig`，学习率 1e-4 |
+| 微调 | `ai_model/train/finetune.py` | `merged_annotations.json` 精细标注 | 使用 `FineTuneConfig`，支持冻结编码器、较小学习率 |
+
+两者均调用 `train_common.train_model()` 执行训练循环，CLI 入口见 [cli.md](./cli.md)。
 
 ---
 
@@ -654,14 +666,20 @@ def extract(pred_prob, threshold=0.5):
 
 ```
 ai_model/
-├── models/                    # 模型定义
-│   └── unet1d.py              # 1D U-Net模型、损失函数、评估指标
-├── data/                      # 数据处理
-│   └── dataset.py             # 特征提取、标签生成、数据集、IntervalExtractor
-├── train/                     # 训练模块
-│   └── train.py               # 训练主脚本
-└── inference/                 # 推理模块
-    └── infer.py               # 预测类和推理脚本
+├── models/                        # 模型定义
+│   └── unet1d.py                  # 1D U-Net模型、损失函数、评估指标
+├── data/                          # 数据处理
+│   ├── dataset.py                 # 特征提取、标签生成、数据集、IntervalExtractor
+│   └── generate_dataset_split.py  # 数据集划分、字符宽度预计算
+├── train/                         # 训练模块
+│   ├── train_config.py            # TrainConfig / FineTuneConfig 配置类
+│   ├── train_common.py            # 共享训练循环 train_model()、evaluate_model() 等
+│   ├── pretrain.py                # 预训练主流程（使用 rule_jsons 数据）
+│   ├── finetune.py                # 微调主流程（使用合并标注数据，支持冻结编码器）
+│   └── active_learning.py         # ActiveLearner / RuleBasedActiveLearner
+└── inference/                     # 推理模块
+    ├── infer.py                   # CharSegmentPredictor 预测类
+    └── visualize_comparison.py    # 规则 vs 模型对比可视化
 ```
 
 ### 9.2 文件职责
@@ -670,8 +688,14 @@ ai_model/
 |------|------|-------------|
 | `models/unet1d.py` | 模型架构 | UNet1D, DiceBCELoss |
 | `data/dataset.py` | 数据处理 | FeatureExtractor, LabelGenerator, CharSegmentDataset |
-| `train/train.py` | 训练流程 | train_model(), main() |
+| `data/generate_dataset_split.py` | 数据集划分 | generate_dataset_split(), compute_char_width_stats() |
+| `train/train_config.py` | 训练配置 | TrainConfig, FineTuneConfig |
+| `train/train_common.py` | 通用训练流程 | train_model(), evaluate_model(), save_model_and_history(), setup_scheduler() |
+| `train/pretrain.py` | 预训练 | main()（使用 rule_jsons 数据） |
+| `train/finetune.py` | 微调 | main()（使用合并标注，支持冻结编码器） |
+| `train/active_learning.py` | 主动学习 | ActiveLearner, RuleBasedActiveLearner |
 | `inference/infer.py` | 推理接口 | CharSegmentPredictor |
+| `inference/visualize_comparison.py` | 对比可视化 | compare() |
 
 ---
 

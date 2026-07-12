@@ -417,6 +417,7 @@ python cli.py predict line <image_path> [options]
 | `--model-path` | path | models/char_segment_1d_unet_best.pth | 模型权重路径 |
 | `--output` | str | — | 可视化结果保存路径（默认不保存） |
 | `--threshold` | float | 0.5 | 字符概率阈值 |
+| `--max-gap` | int | 2 | 合并小间隙的最大像素宽度（设为 -1 禁用合并） |
 
 **示例：**
 
@@ -426,6 +427,9 @@ python cli.py predict line ./datahome/lines/xxx.png --output result.png
 
 # 调整阈值
 python cli.py predict line ./datahome/lines/xxx.png --threshold 0.3
+
+# 禁用间隙合并
+python cli.py predict line ./datahome/lines/xxx.png --max-gap -1
 ```
 
 ---
@@ -446,6 +450,8 @@ python cli.py predict compare <line_id> [options]
 | `--image-path` | path | — | 直接指定行图像路径（替代 data_base_path + line_id） |
 | `--rule-json-path` | path | — | 直接指定规则 JSON 路径 |
 | `--save-dir` | str | ./visualization | 可视化结果保存目录 |
+| `--max-gap` | int | 2 | 模型合并间隙（特征像素，设为 -1 禁用合并） |
+| `--threshold` | float | 0.3 | 模型预测概率阈值（注意：默认 0.3，与 predict line 的 0.5 不同） |
 
 **示例：**
 
@@ -457,6 +463,9 @@ python cli.py predict compare page_pdf_1_line_0 --data-base-path ./datahome
 python cli.py predict compare dummy \
     --image-path ./datahome/lines/xxx.png \
     --rule-json-path ./datahome/rule_jsons/xxx_rule.json
+
+# 调整模型预测阈值
+python cli.py predict compare page_pdf_1_line_0 --threshold 0.5
 ```
 
 生成的对比图包含 4 行：

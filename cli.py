@@ -273,13 +273,12 @@ def train_rule_based_al(top_n, data_base_path, chunk_size):
 
     click.echo(f"\n[INFO] Top {len(ranked_lines)} 最可能切割错误的行：")
     click.echo("-" * 130)
-    click.echo(f"{'排名':<4} {'行ID':<40} {'AL分数':<10} {'粘连':<8} {'过度合并':<8} {'合并不足':<8} {'合并率':<8}")
+    click.echo(f"{'排名':<4} {'行ID':<40} {'AL分数':<10} {'粘连不可分':<12} {'合并不足':<10}")
     click.echo("-" * 130)
 
     for idx, item in enumerate(ranked_lines, 1):
         click.echo(f"{idx:<4} {item['line_id']:<40} {item['al_score']:<10.4f} "
-                   f"{item['stuck_char']:<8.4f} {item['over_merge']:<8.4f} "
-                   f"{item['under_merge']:<8.4f} {item['merge_ratio']:<8.4f}")
+                   f"{item['stuck_unsplittable']:<12.4f} {item['under_merged']:<10.4f}")
 
     output_path = model_dir / "rule_based_al_ranking.json"
     import json
@@ -360,20 +359,10 @@ def predict_line(image_path, model_path, output, threshold, max_gap):
               help="可视化结果保存目录")
 @click.option("--max-gap", type=int, default=2, show_default=True,
               help="模型合并间隙（特征像素，设为 -1 禁用合并）")
-@click.option("--merge-min-gap", type=int, default=3, show_default=True,
-              help="规则后处理合并：最小间隙")
-@click.option("--merge-single-ratio", type=float, default=0.7, show_default=True,
-              help="规则后处理合并：单字符宽高比上限")
-@click.option("--merge-min-ratio", type=float, default=0.5, show_default=True,
-              help="规则后处理合并：合并后宽高比下限")
-@click.option("--merge-max-ratio", type=float, default=1.5, show_default=True,
-              help="规则后处理合并：合并后宽高比上限")
 @click.option("--threshold", type=float, default=0.3, show_default=True,
               help="模型预测概率阈值")
 def predict_compare(line_id, data_base_path, image_path, rule_json_path,
-                    model_path, save_dir, max_gap, merge_min_gap,
-                    merge_single_ratio, merge_min_ratio, merge_max_ratio,
-                    threshold):
+                    model_path, save_dir, max_gap, threshold):
     """对比规则与模型的切割结果（生成五行可视化图）"""
     # 直接委托给 visualize_comparison 的 CLI
     from ai_model.inference.visualize_comparison import cli as viz_cli
@@ -392,14 +381,6 @@ def predict_compare(line_id, data_base_path, image_path, rule_json_path,
     if save_dir:
         argv += ["--save-dir", str(save_dir)]
     argv += ["--max-gap", str(max_gap)]
-    if merge_min_gap != 3:
-        argv += ["--merge-min-gap", str(merge_min_gap)]
-    if abs(merge_single_ratio - 0.7) > 1e-6:
-        argv += ["--merge-single-ratio", str(merge_single_ratio)]
-    if abs(merge_min_ratio - 0.5) > 1e-6:
-        argv += ["--merge-min-ratio", str(merge_min_ratio)]
-    if abs(merge_max_ratio - 1.5) > 1e-6:
-        argv += ["--merge-max-ratio", str(merge_max_ratio)]
     if abs(threshold - 0.3) > 1e-6:
         argv += ["--threshold", str(threshold)]
 
