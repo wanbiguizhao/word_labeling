@@ -61,11 +61,11 @@ torch_cache/
 ai_model/data/dataset_split.json
 ai_model/models/al_ranking.json
 ai_model/models/rule_based_al_ranking.json
-cutting_labeling_system/*
-cutting_labeling_system
+cutting_labeling_system/frontend/node_modules/*
 tmp_*
 image_alignment*
 create_sample_data.py
 generate_line_id_list.py
 ai_model/data/dataset_split_merged.json
 ai_model/models/merged_annotation_al_ranking.json
+cutting_labeling_system/frontend/node_modules/*
