@@ -24,8 +24,7 @@ def train_epoch(
     use_amp: bool,
     warmup_epochs: int,
     current_epoch: int,
-    base_lr: float,
-    num_classes: int = 3
+    base_lr: float
 ) -> Tuple[float, float, float]:
     model.train()
     train_loss = 0.0
