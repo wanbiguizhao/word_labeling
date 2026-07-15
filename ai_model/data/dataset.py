@@ -447,7 +447,7 @@ class CharSegmentDataset(Dataset):
         return {
             'line_id': line_id,
             'features': features.astype(np.float32),
-            'label': label.astype(np.float32),
+            'label': label.astype(np.int64),
             'width': resized_w,
             'height': 64,
             'scale': scale,
@@ -462,7 +462,7 @@ def collate_fn(batch):
     # 预分配连续数组，避免多次 np.pad + np.array 的开销
     n_channels = batch[0]['features'].shape[0]
     features_arr = np.zeros((batch_size, n_channels, max_width), dtype=np.float32)
-    labels_arr = np.zeros((batch_size, max_width), dtype=np.float32)
+    labels_arr = np.zeros((batch_size, max_width), dtype=np.int64)
     line_ids = [None] * batch_size
     char_widths = np.zeros(batch_size, dtype=np.float32)
     
