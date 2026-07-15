@@ -52,37 +52,122 @@ def load_json_file(file_path: Path) -> Optional[dict]:
 
 
 def chars_to_lines(chars: List[dict], image_width: int) -> List[dict]:
-    line_dict = {}
+    """
+    将字符区间转换为切割线（支持共享边界）
+    
+    共享边界支持：
+        当 char1.col_end == char2.col_start 时，该位置只生成一条紫色线，
+        表示上一个字符的结束和下一个字符的开始。
+    
+    颜色定义：
+        red (#ff0000) = 字符开始线
+        green (#00ff00) = 字符结束线
+        purple (#9932cc) = 共享边界
+    
+    Args:
+        chars: 字符列表，每个包含 col_start, col_end
+        image_width: 图像宽度
+    
+    Returns:
+        lines: 切割线列表，每个包含 pos, color
+    """
+    all_starts = set()
+    all_ends = set()
+    
     for char in chars:
         col_start = char.get("col_start")
-        if col_start is not None and col_start != 0:
-            line_dict[col_start] = "red"
-    for char in chars:
         col_end = char.get("col_end")
-        if col_end is not None and col_end != 0:
-            line_dict[col_end] = "green"
-
+        if col_start is not None:
+            all_starts.add(col_start)
+        if col_end is not None:
+            all_ends.add(col_end)
+    
+    shared_boundaries = all_starts & all_ends
+    
+    line_dict = {}
+    
+    for char in chars:
+        col_start = char.get("col_start")
+        col_end = char.get("col_end")
+        
+        if col_start is not None:
+            if col_start in shared_boundaries:
+                line_dict[col_start] = "#9932cc"
+            elif col_start not in line_dict:
+                line_dict[col_start] = "red"
+        
+        if col_end is not None:
+            if col_end in shared_boundaries:
+                line_dict[col_end] = "#9932cc"
+            elif col_end not in line_dict:
+                line_dict[col_end] = "green"
+    
     lines = [{"pos": pos, "color": color} for pos, color in line_dict.items()]
     lines.sort(key=lambda x: x["pos"])
     return lines
 
 
 def lines_to_chars(lines: List[dict]) -> List[dict]:
+    """
+    将切割线转换为字符区间（支持共享边界）
+    
+    颜色定义：
+        red (#ff0000) = 字符开始线
+        green (#00ff00) = 字符结束线
+        purple (#9932cc) = 共享边界（既是上一个字符的结束，也是下一个字符的开始）
+    
+    转换逻辑：
+        1. 遍历排序后的切割线
+        2. 遇到红色或紫色线 → 开始新字符的起始位置
+        3. 遇到绿色或紫色线 → 当前字符结束
+        4. 支持共享边界：紫色线同时作为上一个字符的结束和下一个字符的开始
+    
+    Args:
+        lines: 切割线列表，每个包含 pos, color
+    
+    Returns:
+        chars: 字符列表，每个包含 col_start, col_end, width
+    """
     sorted_lines = sorted(lines, key=lambda x: x["pos"])
     chars = []
+    
     i = 0
-    while i < len(sorted_lines):
-        if i + 1 < len(sorted_lines):
-            col_start = sorted_lines[i]["pos"]
-            col_end = sorted_lines[i + 1]["pos"]
-            chars.append({
-                "col_start": col_start,
-                "col_end": col_end,
-                "width": col_end - col_start
-            })
-            i += 2
+    n = len(sorted_lines)
+    
+    while i < n:
+        current_line = sorted_lines[i]
+        current_color = current_line.get("color", "#ff0000")
+        
+        if current_color in ["#ff0000", "red", "#9932cc", "purple"]:
+            col_start = current_line["pos"]
+            
+            j = i + 1
+            while j < n:
+                next_line = sorted_lines[j]
+                next_color = next_line.get("color", "#00ff00")
+                
+                if next_color in ["#00ff00", "green", "#9932cc", "purple"]:
+                    col_end = next_line["pos"]
+                    
+                    if col_end > col_start:
+                        chars.append({
+                            "col_start": col_start,
+                            "col_end": col_end,
+                            "width": col_end - col_start
+                        })
+                    
+                    if next_color in ["#ff0000", "red", "#9932cc", "purple"]:
+                        i = j
+                    else:
+                        i = j + 1
+                    break
+                
+                j += 1
+            else:
+                i += 1
         else:
             i += 1
+    
     return chars
 
 
@@ -308,15 +393,21 @@ async def get_images(body: ImageListRequest):
     for item in all_items:
         is_annotated = annotation_registry.is_annotated(item["line_id"])
 
-        if body.is_annotated is not None and is_annotated != body.is_annotated:
-            continue
+        is_postponed = annotation_registry.is_postponed(item["line_id"])
+
+        if body.is_annotated is not None:
+            if body.is_annotated and not is_annotated:
+                continue
+            if not body.is_annotated and (is_annotated or is_postponed):
+                continue
 
         filtered_items.append({
             "id": item["id"],
             "line_id": item["line_id"],
             "image_path": item["image_path"],
             "char_count": item["char_count"],
-            "is_annotated": is_annotated
+            "is_annotated": is_annotated,
+            "is_postponed": is_postponed
         })
 
     total = len(filtered_items)
