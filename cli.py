@@ -389,6 +389,194 @@ def predict_compare(line_id, data_base_path, image_path, rule_json_path,
 
 
 # ============================================================
+# 命令组：project - 项目管理相关
+# ============================================================
+@click.group()
+def project():
+    """项目管理：批量推理、缓存生成等"""
+
+
+@project.command("infer")
+@click.argument("project_id", type=str)
+@click.option("--model-path", type=click.Path(exists=True), default=None,
+              help="模型权重路径（默认: models/char_segment_1d_unet_best.pth）")
+@click.option("--data-base-path", type=click.Path(exists=True), default=None,
+              help="数据基础目录（默认: <项目根>/datahome）")
+@click.option("--batch-size", type=int, default=32, show_default=True,
+              help="GPU批量推理批大小")
+@click.option("--threshold", type=float, default=0.5, show_default=True,
+              help="模型预测概率阈值")
+def project_infer(project_id, model_path, data_base_path, batch_size, threshold):
+    """批量使用模型对项目中的图片进行推理
+    
+    从项目的 line_id_list.json 获取 line_id，使用指定模型进行推理，
+    结果保存到项目目录的 model_jsons 文件夹中。
+    """
+    import json
+    import cv2
+    import numpy as np
+    from ai_model.inference.infer import CharSegmentPredictor
+    
+    data_path = Path(data_base_path) if data_base_path else BASE_DIR / "datahome"
+    project_root = data_path / "project" / project_id
+    
+    line_id_list_path = project_root / "line_id_list.json"
+    if not line_id_list_path.exists():
+        click.echo(f"[ERROR] line_id_list.json 不存在: {line_id_list_path}", err=True)
+        sys.exit(1)
+    
+    with open(line_id_list_path, 'r', encoding='utf-8') as f:
+        line_id_data = json.load(f)
+    
+    line_ids = line_id_data.get('line_ids', [])
+    click.echo(f"[INFO] 项目 {project_id} 包含 {len(line_ids)} 条数据")
+    
+    model_dir = BASE_DIR / "ai_model" / "models"
+    if model_path:
+        model_file = Path(model_path)
+    else:
+        model_file = model_dir / "char_segment_1d_unet_best.pth"
+    
+    if not model_file.exists():
+        click.echo(f"[ERROR] 模型文件不存在: {model_file}", err=True)
+        sys.exit(1)
+    
+    click.echo(f"[INFO] 加载模型: {model_file}")
+    predictor = CharSegmentPredictor(model_file)
+    
+    model_jsons_dir = project_root / "model_jsons"
+    model_jsons_dir.mkdir(parents=True, exist_ok=True)
+    
+    success_count = 0
+    fail_count = 0
+    
+    click.echo(f"[INFO] 开始批量推理（batch_size={batch_size}）...")
+    
+    for i, line_id in enumerate(line_ids):
+        line_img_path = data_path / "lines" / f"{line_id}.png"
+        
+        if not line_img_path.exists():
+            click.echo(f"[WARN] 图像不存在: {line_img_path}")
+            fail_count += 1
+            continue
+        
+        img = cv2.imread(str(line_img_path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            click.echo(f"[WARN] 无法读取图像: {line_img_path}")
+            fail_count += 1
+            continue
+        
+        result = predictor.predict(img)
+        if result is None:
+            fail_count += 1
+            continue
+        
+        intervals, pred_prob, pred_logits, scale = result
+        
+        chars = []
+        for idx, (start, end) in enumerate(intervals):
+            chars.append({
+                "char_id": f"{line_id}_char_{idx}",
+                "line_id": line_id,
+                "char_idx": idx,
+                "col_start": start,
+                "col_end": end,
+                "width": end - start
+            })
+        
+        output_data = {
+            "line_id": line_id,
+            "chars": chars,
+            "char_count": len(chars),
+            "width": img.shape[1],
+            "height": img.shape[0],
+            "threshold": threshold,
+            "model_path": str(model_file.name)
+        }
+        
+        output_path = model_jsons_dir / f"{line_id}_model.json"
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, ensure_ascii=False, indent=2)
+        
+        success_count += 1
+        
+        if (i + 1) % batch_size == 0:
+            click.echo(f"[INFO] 已处理 {i + 1}/{len(line_ids)} ({success_count}成功, {fail_count}失败)")
+    
+    click.echo(f"\n[INFO] 批量推理完成!")
+    click.echo(f"[INFO] 成功: {success_count}")
+    click.echo(f"[INFO] 失败: {fail_count}")
+    click.echo(f"[INFO] 输出目录: {model_jsons_dir}")
+
+
+@project.command("cache-lineage")
+@click.argument("project_id", type=str)
+@click.option("--data-base-path", type=click.Path(exists=True), default=None,
+              help="数据基础目录（默认: <项目根>/datahome）")
+def project_cache_lineage(project_id, data_base_path):
+    """生成项目的 lineage_cache.json 缓存
+    
+    基于项目的 line_id_list.json，从全局 lineage.json 中提取相关数据，
+    生成项目级的 lineage_cache.json 文件。
+    """
+    import json
+    
+    data_path = Path(data_base_path) if data_base_path else BASE_DIR / "datahome"
+    project_root = data_path / "project" / project_id
+    
+    line_id_list_path = project_root / "line_id_list.json"
+    if not line_id_list_path.exists():
+        click.echo(f"[ERROR] line_id_list.json 不存在: {line_id_list_path}", err=True)
+        sys.exit(1)
+    
+    with open(line_id_list_path, 'r', encoding='utf-8') as f:
+        line_id_data = json.load(f)
+    
+    line_ids = line_id_data.get('line_ids', [])
+    click.echo(f"[INFO] 项目 {project_id} 包含 {len(line_ids)} 条数据")
+    
+    lineage_path = data_path / "lineage.json"
+    if not lineage_path.exists():
+        click.echo(f"[ERROR] 全局 lineage.json 不存在: {lineage_path}", err=True)
+        sys.exit(1)
+    
+    click.echo(f"[INFO] 加载全局 lineage.json（可能需要数秒）...")
+    with open(lineage_path, 'r', encoding='utf-8') as f:
+        global_lineage = json.load(f)
+    
+    global_lines = global_lineage.get('lines', {})
+    global_chars = global_lineage.get('chars', {})
+    
+    click.echo(f"[INFO] 全局 lineage.json 包含 {len(global_lines)} 行数据")
+    
+    project_lines = {}
+    project_chars = {}
+    
+    for line_id in line_ids:
+        if line_id in global_lines:
+            project_lines[line_id] = global_lines[line_id]
+            
+            char_ids = global_lines[line_id].get('chars', [])
+            for char_id in char_ids:
+                if char_id in global_chars:
+                    project_chars[char_id] = global_chars[char_id]
+    
+    cache_data = {
+        "lines": project_lines,
+        "chars": project_chars
+    }
+    
+    cache_path = project_root / "lineage_cache.json"
+    with open(cache_path, 'w', encoding='utf-8') as f:
+        json.dump(cache_data, f, ensure_ascii=False)
+    
+    click.echo(f"[INFO] lineage_cache.json 生成完成!")
+    click.echo(f"[INFO] 行数: {len(project_lines)}")
+    click.echo(f"[INFO] 字符数: {len(project_chars)}")
+    click.echo(f"[INFO] 输出文件: {cache_path}")
+
+
+# ============================================================
 # 顶层命令组
 # ============================================================
 class AliasedGroup(click.Group):
@@ -408,6 +596,7 @@ def cli():
 cli.add_command(segment)
 cli.add_command(train)
 cli.add_command(predict)
+cli.add_command(project)
 
 
 if __name__ == "__main__":
