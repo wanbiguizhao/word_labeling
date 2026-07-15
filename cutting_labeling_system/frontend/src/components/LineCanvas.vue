@@ -11,7 +11,7 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted } from 'vue'
+import { ref, watch, onMounted, onUnmounted } from 'vue'
 
 const props = defineProps({
   imageUrl: String,
@@ -157,7 +157,7 @@ function onKeyDown(e) {
   if (e.key === 'ArrowRight') {
     const newLines = JSON.parse(JSON.stringify(props.lines))
     props.selectedIndexes.forEach(index => {
-      if (newLines[index].pos < (cv.value?.width || Infinity)) {
+      if (newLines[index].pos < (img.width || Infinity)) {
         newLines[index].pos += 1
       }
     })
@@ -179,5 +179,16 @@ onMounted(() => {
   canvas.addEventListener('click', onCanvasClick)
   window.addEventListener('keydown', onKeyDown)
   draw()
+})
+
+onUnmounted(() => {
+  const canvas = cv.value
+  if (canvas) {
+    canvas.removeEventListener('mousedown', onMouseDown)
+    canvas.removeEventListener('mousemove', onMouseMove)
+    canvas.removeEventListener('click', onCanvasClick)
+  }
+  window.removeEventListener('mouseup', onMouseUp)
+  window.removeEventListener('keydown', onKeyDown)
 })
 </script>

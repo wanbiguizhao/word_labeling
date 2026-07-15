@@ -61,8 +61,8 @@
         <div class="card-info">
           <div class="card-title">{{ item.line_id }}</div>
           <div class="card-meta">
-            <a-tag :color="item.is_annotated ? 'green' : 'gray'">
-              {{ item.is_annotated ? '已标注' : '待标注' }}
+            <a-tag :color="item.is_annotated ? 'green' : (item.is_postponed ? 'orange' : 'gray')">
+              {{ item.is_annotated ? '已标注' : (item.is_postponed ? '暂不标注' : '待标注') }}
             </a-tag>
             <span class="char-count">字符数: {{ item.char_count }}</span>
           </div>
@@ -85,7 +85,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { Button as aButton, Statistic as aStatistic, Pagination as aPagination, Input as aInput, Tag as aTag, Select as aSelect, SelectOption as aSelectOption } from 'ant-design-vue'
 import { SearchOutlined } from '@ant-design/icons-vue'
@@ -184,7 +184,8 @@ const loadStats = async () => {
 }
 
 const goLabel = (id) => {
-  router.push({ path: `/label/${id}`, query: { project_id: currentProject.value } })
+  const url = `/label/${id}?project_id=${currentProject.value}`
+  window.open(url, '_blank')
 }
 
 const goBack = () => {
@@ -204,10 +205,37 @@ const goNextLabel = async () => {
   }
 }
 
-onMounted(() => {
+const initData = () => {
   currentProject.value = route.query.project_id || null
   loadList()
   loadStats()
+}
+
+const handleStorageChange = (e) => {
+  if (e.key === 'annotation_status_change') {
+    try {
+      const statusData = JSON.parse(e.newValue)
+      if (statusData.project_id === currentProject.value) {
+        loadList()
+        loadStats()
+      }
+    } catch (error) {
+      console.error('解析状态变更数据失败:', error)
+    }
+  }
+}
+
+onMounted(() => {
+  initData()
+  window.addEventListener('storage', handleStorageChange)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('storage', handleStorageChange)
+})
+
+watch(() => route.fullPath, () => {
+  initData()
 })
 </script>
 
@@ -229,4 +257,14 @@ onMounted(() => {
 .card-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .char-count { font-size: 12px; color: #666; }
 .pagination-container { display: flex; justify-content: center; }
+
+:deep(.ant-pagination-options) {
+  .ant-select {
+    width: 100px;
+  }
+  .ant-select-dropdown {
+    min-width: 100px !important;
+    width: auto !important;
+  }
+}
 </style>

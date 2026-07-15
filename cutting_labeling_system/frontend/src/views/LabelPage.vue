@@ -130,10 +130,13 @@
                 无
               </a-radio-button>
               <a-radio-button value="#ff0000">
-                <span style="color: #ff0000;">■</span> 红线
+                <span style="color: #ff0000;">■</span> 红线(开始)
+              </a-radio-button>
+              <a-radio-button value="#9932cc">
+                <span style="color: #9932cc;">■</span> 紫线(共享)
               </a-radio-button>
               <a-radio-button value="#00ff00">
-                <span style="color: #00aa00;">■</span> 绿线
+                <span style="color: #00aa00;">■</span> 绿线(结束)
               </a-radio-button>
             </a-radio-group>
           </div>
@@ -152,6 +155,9 @@
           <div class="edit-hint" v-else>
             <strong>编辑模式：</strong>
             <span>单击选择（8px范围内）| Ctrl+拖拽框选多选 | Delete删除 | 方向键微调位置 | 点击空白处添加线条</span>
+            <br>
+            <strong>线色说明：</strong>
+            <span><span style="color: #ff0000;">■</span>红线=字符开始 | <span style="color: #9932cc;">■</span>紫线=共享边界（上一字结束=下一字开始） | <span style="color: #00aa00;">■</span>绿线=字符结束</span>
           </div>
           <div class="editable-canvas-wrapper">
             <LineCanvas
@@ -388,6 +394,17 @@ const clearAll = () => {
   selectedIndexes.value = []
 }
 
+const notifyStatusChange = () => {
+  const statusData = {
+    line_id: lineId,
+    project_id: currentProject.value,
+    is_annotated: is_annotated.value,
+    is_postponed: is_postponed.value,
+    timestamp: Date.now()
+  }
+  localStorage.setItem('annotation_status_change', JSON.stringify(statusData))
+}
+
 const saveAnnotation = async () => {
   try {
     const data = {
@@ -402,6 +419,7 @@ const saveAnnotation = async () => {
     is_postponed.value = false
     annotationLines.value = [...editedLines.value]
     await loadDetail()
+    notifyStatusChange()
     alert('标注保存成功')
   } catch (error) {
     alert('保存失败，请重试')
@@ -420,6 +438,7 @@ const handlePostpone = async () => {
     await imagesApi.postpone(lineId, currentProject.value)
     is_postponed.value = true
     is_annotated.value = false
+    notifyStatusChange()
     alert('已标记为暂不标注')
   } catch (error) {
     alert('操作失败')
@@ -431,6 +450,7 @@ const handleUnpostpone = async () => {
   try {
     await imagesApi.unpostpone(lineId, currentProject.value)
     is_postponed.value = false
+    notifyStatusChange()
     alert('已取消暂不标注')
   } catch (error) {
     alert('操作失败')
