@@ -32,9 +32,12 @@ cli.py
 │   ├── split-dataset        # 生成数据集划分文件
 │   ├── active-learn         # 主动学习（基于模型）：找出最需标注的行
 │   └── rule-based-al        # 主动学习（基于规则）：仅用规则识别可能切割错误的样本
-└── predict          # 使用模型进行推理
-    ├── line         # 对单行图像进行字符分割
-    └── compare      # 对比规则与模型的切割结果
+├── predict          # 使用模型进行推理
+│   ├── line         # 对单行图像进行字符分割
+│   └── compare      # 对比规则与模型的切割结果
+└── project          # 项目管理
+    ├── infer        # 批量使用模型对项目图片进行推理
+    └── cache-lineage # 生成项目的 lineage_cache.json 缓存
 ```
 
 ---
@@ -513,6 +516,162 @@ python ai_model/inference/infer.py predict ./datahome/lines/xxx.png --output res
 
 # 对比可视化
 python ai_model/inference/visualize_comparison.py compare page_pdf_1_line_0 --data-base-path ./datahome
+```
+
+---
+
+## 4. 项目管理 (project)
+
+### project infer — 批量模型推理
+
+对项目中的所有图片进行批量模型推理，结果保存到项目目录的 `model_jsons` 文件夹中。
+
+```bash
+python cli.py project infer <project_id> [options]
+```
+
+**参数：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `project_id` | str (必填) | — | 项目 ID（如 `proj_20260706_230417`） |
+| `--model-path` | path | models/char_segment_1d_unet_best.pth | 模型权重路径 |
+| `--data-base-path` | path | ./datahome | 数据基础目录 |
+| `--batch-size` | int | 32 | 进度输出间隔（每处理多少条输出一次） |
+| `--threshold` | float | 0.5 | 模型预测概率阈值 |
+
+**示例：**
+
+```bash
+# 使用默认模型批量推理
+python cli.py project infer proj_20260706_230417
+
+# 指定模型路径
+python cli.py project infer proj_20260706_230417 \
+    --model-path ./models/char_segment_1d_unet_best_0629.pth
+
+# 指定数据基础目录
+python cli.py project infer proj_20260706_230417 \
+    --data-base-path /path/to/datahome
+```
+
+**工作流程：**
+
+1. 读取项目的 `line_id_list.json` 获取所有 line_id
+2. 加载指定模型
+3. 遍历每张图片，执行模型推理
+4. 将推理结果保存到 `project/<project_id>/model_jsons/{line_id}_model.json`
+
+**输出格式（每个 `{line_id}_model.json`）：**
+
+```json
+{
+  "line_id": "line_page_pdf_gwyb195510_20_0",
+  "chars": [
+    {"char_id": "line_page_pdf_gwyb195510_20_0_char_0", "line_id": "line_page_pdf_gwyb195510_20_0", "char_idx": 0, "col_start": 10, "col_end": 45, "width": 35},
+    {"char_id": "line_page_pdf_gwyb195510_20_0_char_1", "line_id": "line_page_pdf_gwyb195510_20_0", "char_idx": 1, "col_start": 50, "col_end": 85, "width": 35}
+  ],
+  "char_count": 40,
+  "width": 2015,
+  "height": 46,
+  "threshold": 0.5,
+  "model_path": "char_segment_1d_unet_best.pth"
+}
+```
+
+**输出字段说明：**
+
+| 字段 | 说明 |
+|------|------|
+| `line_id` | 行 ID |
+| `chars` | 字符列表，每个字符包含起始/结束列和宽度 |
+| `char_count` | 字符数量 |
+| `width` | 图像宽度 |
+| `height` | 图像高度 |
+| `threshold` | 使用的概率阈值 |
+| `model_path` | 使用的模型文件名 |
+
+---
+
+### project cache-lineage — 生成规则缓存
+
+基于项目的 `line_id_list.json`，从全局 `lineage.json` 中提取相关数据，生成项目级的 `lineage_cache.json` 文件，用于加速前端页面加载。
+
+```bash
+python cli.py project cache-lineage <project_id> [options]
+```
+
+**参数：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `project_id` | str (必填) | — | 项目 ID |
+| `--data-base-path` | path | ./datahome | 数据基础目录 |
+
+**示例：**
+
+```bash
+python cli.py project cache-lineage proj_20260706_230417
+```
+
+**工作流程：**
+
+1. 读取项目的 `line_id_list.json` 获取所有 line_id
+2. 加载全局 `lineage.json`（可能需要数秒）
+3. 提取项目相关的行数据和字符数据
+4. 生成项目级的 `lineage_cache.json`
+
+**输出示例：**
+
+```
+[INFO] 项目 proj_20260706_230417 包含 1353 条数据
+[INFO] 加载全局 lineage.json（可能需要数秒）...
+[INFO] 全局 lineage.json 包含 37649 行数据
+[INFO] lineage_cache.json 生成完成!
+[INFO] 行数: 1353
+[INFO] 字符数: 45678
+[INFO] 输出文件: ./datahome/project/proj_20260706_230417/lineage_cache.json
+```
+
+**用途：**
+
+生成的 `lineage_cache.json` 会被前端标注系统自动使用，避免每次加载页面时扫描整个 `rule_jsons` 目录，大幅提升页面加载速度（从 16+ 秒降至 < 1 秒）。
+
+---
+
+## 各模块独立调用
+
+每个模块也支持独立调用（无需通过 `cli.py`）：
+
+```bash
+# 数据分割
+python image_tools/segment_manager.py single <pdf_name>
+python image_tools/segment_manager.py batch --start 0 --end 10
+
+# 模型训练（预训练）
+python ai_model/train/pretrain.py --batch-size 64 --epochs 50
+
+# 模型训练（微调）
+python ai_model/train/finetune.py --dataset datahome/datasets/merged_annotations.json \
+    --pretrained-model models/char_segment_1d_unet_best.pth --epochs 30
+
+# 数据集划分
+python ai_model/data/generate_dataset_split.py split-dataset --train-ratio 0.8
+
+# 主动学习
+python ai_model/train/active_learning.py active-learn 100
+
+# 单行推理
+python ai_model/inference/infer.py predict ./datahome/lines/xxx.png --output result.png
+
+# 对比可视化
+python ai_model/inference/visualize_comparison.py compare page_pdf_1_line_0 --data-base-path ./datahome
+
+# 批量推理（通过 cli.py）
+python cli.py project infer proj_20260706_230417
+
+# 生成缓存（通过 cli.py）
+python cli.py project cache-lineage proj_20260706_230417
 ```
 
 ---

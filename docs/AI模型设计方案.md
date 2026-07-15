@@ -8,6 +8,7 @@
 | v1.1 | 2026-06-28 | System | 文档修正：标签生成已使用后处理合并逻辑，引用实际代码实现 |
 | v1.2 | 2026-06-29 | System | 新增ROI-IOU和拆分IOU指标；字符宽度自动计算；数据集预计算优化 |
 | v1.3 | 2026-07-10 | System | 同步代码结构：预训练/微调拆分、共享训练逻辑、主动学习模块 |
+| v1.4 | 2026-07-14 | System | 支持共享边界标注：解码器重新设计，支持用一根线划分两个字符 |
 
 ---
 
@@ -226,7 +227,27 @@ def resize_image(line_img, target_height=64):
 
 ### 4.2 标签生成
 
-标签生成在 `dataset.py` 的 `LabelGenerator.generate()` 中实现，**已包含后处理合并逻辑**：
+标签生成在 `dataset.py` 的 `LabelGenerator.generate()` 中实现，**已包含后处理合并逻辑**，并支持共享边界标注：
+
+**3类标注方案（支持共享边界）：**
+
+| 类别 | 值 | 说明 |
+|------|-----|------|
+| 空白区域 | 0 | 字符外部的背景区域 |
+| 边界 | 1 | 字符的起始列和结束列，支持共享边界 |
+| 字符内部 | 2 | 非边界的字符区域（宽度≥3的字符） |
+
+**共享边界支持：**
+
+当两个字符共享边界时（`char1.col_end == char2.col_start`），该位置被标记为边界(1)，解码器会将其识别为上一个字符的结束和下一个字符的开始，从而实现用一根线划分两个字符。
+
+**示例：**
+```
+正常字符（宽度≥3）：[1, 2, 2, 1] → 边界点[0,3] → 区间(0,3)
+共享边界（两个字符）：[1, 2, 1, 2, 1] → 边界点[0,2,4] → 区间(0,2), (2,4)
+宽度1字符：[1] → 边界点[0] → 区间(0,0)
+宽度2字符：[1, 1] → 边界点[0,1] → 区间(0,1)
+```
 
 ```python
 # dataset.py 第84-134行
@@ -238,8 +259,8 @@ def generate(
     scale: float = 1.0,
     merge_enabled: bool = True  # 默认启用合并
 ) -> np.ndarray:
-    """从字符段生成标签数组"""
-    label = np.zeros(image_width, dtype=np.float32)
+    """从字符段生成3类序列标签数组（支持共享边界）"""
+    label = np.zeros(image_width, dtype=np.int64)
 
     # 1. 提取区间并转换到缩放后的坐标
     intervals = []
@@ -259,9 +280,18 @@ def generate(
             max_ratio=MERGE_MAX_ASPECT_RATIO         # 默认1.5
         )
 
-    # 3. 生成标签
+    # 3. 生成3类序列标签
     for start, end in intervals:
-        label[start:end+1] = 1.0
+        char_width = end - start + 1
+        if char_width == 1:
+            label[start] = 1
+        elif char_width == 2:
+            label[start] = 1
+            label[end] = 1
+        else:
+            label[start] = 1
+            label[end] = 1
+            label[start + 1:end] = 2
 
     return label
 ```
