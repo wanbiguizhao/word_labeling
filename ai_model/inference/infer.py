@@ -19,17 +19,24 @@ class SequenceDecoder:
     @staticmethod
     def decode(pred_class: np.ndarray, boundary_threshold: float = 0.5) -> List[Tuple[int, int]]:
         """
-        从3类序列预测结果解码字符区间
+        从3类序列预测结果解码字符区间（支持共享边界）
         
         标签定义：
-            0 = 空白
-            1 = 边界（字符起始/结束）
+            0 = 空白（字符外部）
+            1 = 边界（字符起始/结束，支持共享边界）
             2 = 字符内部
         
-        解码逻辑：
-            1. 找所有类别为1的列（边界点）
-            2. 将相邻的边界点配对，形成字符区间
-            3. 处理异常情况：未配对的边界、连续的边界
+        解码逻辑（支持共享边界）：
+            1. 首先基于内部类(2)区域确定字符核心
+            2. 每个内部类区域向左扩展到最近的边界点(1)或0
+            3. 每个内部类区域向右扩展到最近的边界点(1)或图像宽度-1
+            4. 处理没有内部类的边界点对（宽度1或2的字符）
+            5. 支持共享边界：位置N同时是上一个字符的结束和下一个字符的开始
+        
+        示例：
+            正常字符：[1,2,2,1] → 内部区域[1-2] → 扩展到边界(0,3)
+            共享边界：字符A[1,2,1] + 字符B[1,2,1] → 内部区域[1], [3] → 扩展到(0,2), (2,4)
+            宽度1字符：[1,0,1,2,2,1] → 内部区域[3-4] → 扩展到(2,5)，单独边界点(0) → (0,0)
         
         Args:
             pred_class: 预测类别数组（0/1/2），长度=图像宽度
@@ -39,37 +46,72 @@ class SequenceDecoder:
             intervals: [(start_col, end_col), ...] 字符区间列表
         """
         boundary_cols = np.where(pred_class == 1)[0]
+        internal_cols = np.where(pred_class == 2)[0]
         
         if len(boundary_cols) == 0:
             return SequenceDecoder._decode_from_internal(pred_class)
         
         intervals = []
-        i = 0
-        n = len(boundary_cols)
         
-        while i < n:
-            start = boundary_cols[i]
+        if len(internal_cols) > 0:
+            internal_regions = []
+            start = internal_cols[0]
+            prev = internal_cols[0]
+            for col in internal_cols[1:]:
+                if col == prev + 1:
+                    prev = col
+                else:
+                    internal_regions.append((start, prev))
+                    start = col
+                    prev = col
+            internal_regions.append((start, prev))
             
-            if i + 1 < n:
+            for region_start, region_end in internal_regions:
+                left_boundary = boundary_cols[boundary_cols <= region_start]
+                start_col = left_boundary[-1] if len(left_boundary) > 0 else region_start
+                
+                right_boundary = boundary_cols[boundary_cols >= region_end]
+                end_col = right_boundary[0] if len(right_boundary) > 0 else region_end
+                
+                intervals.append((start_col, end_col))
+        
+        used_boundaries = set()
+        for start, end in intervals:
+            used_boundaries.add(start)
+            used_boundaries.add(end)
+        
+        n = len(boundary_cols)
+        i = 0
+        while i < n:
+            if boundary_cols[i] in used_boundaries:
+                i += 1
+                continue
+            
+            if i + 1 < n and boundary_cols[i + 1] not in used_boundaries:
+                start = boundary_cols[i]
                 end = boundary_cols[i + 1]
                 
-                if end == start:
-                    i += 2
-                    continue
+                gap_has_blank = False
+                for col in range(start + 1, end):
+                    if pred_class[col] == 0:
+                        gap_has_blank = True
+                        break
                 
-                i += 2
-            else:
-                end = start
-                i += 1
-            
-            if end >= start:
-                if start + 1 <= end - 1:
-                    has_internal = np.any(pred_class[start + 1:end] == 2)
-                else:
-                    has_internal = True
-                
-                if has_internal:
+                if not gap_has_blank:
                     intervals.append((start, end))
+                    used_boundaries.add(start)
+                    used_boundaries.add(end)
+                    i += 2
+                else:
+                    intervals.append((start, start))
+                    used_boundaries.add(start)
+                    i += 1
+            else:
+                intervals.append((boundary_cols[i], boundary_cols[i]))
+                used_boundaries.add(boundary_cols[i])
+                i += 1
+        
+        intervals.sort(key=lambda x: x[0])
         
         return intervals
     
