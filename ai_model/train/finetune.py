@@ -115,29 +115,48 @@ def main(config: FineTuneConfig = None):
     
     train_ids, val_ids, char_width_stats = load_dataset_split(config)
     
-    if train_ids is None:
-        print("[INFO] 加载行ID列表...")
-        if annotations is not None:
-            line_ids = list(annotations.keys())
-        else:
-            line_ids = load_all_line_ids(data_base_path)
-        print(f"[INFO] 找到 {len(line_ids)} 个行图像")
+    annotation_line_ids = set(annotations.keys()) if annotations is not None else None
+    
+    if annotation_line_ids is not None:
+        print(f"[INFO] 使用标注数据，过滤行ID...")
+        print(f"[INFO] 标注数据包含 {len(annotation_line_ids)} 条记录")
         
-        if len(line_ids) == 0:
-            print("[ERROR] 未找到训练数据")
-            return
+        if train_ids is not None:
+            train_ids = [lid for lid in train_ids if lid in annotation_line_ids]
+            val_ids = [lid for lid in val_ids if lid in annotation_line_ids]
+            print(f"[INFO] 从划分文件过滤后: 训练集 {len(train_ids)}, 验证集 {len(val_ids)}")
         
-        np.random.seed(config.seed)
-        np.random.shuffle(line_ids)
-        
-        split_idx = int(len(line_ids) * config.train_ratio)
-        train_ids = line_ids[:split_idx]
-        val_ids = line_ids[split_idx:]
-        
-        print(f"[WARNING] 划分文件不存在，动态生成划分")
-        print(f"[INFO] 使用种子: {config.seed}")
+        if len(train_ids) == 0 or len(val_ids) == 0:
+            print(f"[WARNING] 过滤后样本不足，重新划分标注数据")
+            line_ids = list(annotation_line_ids)
+            np.random.seed(config.seed)
+            np.random.shuffle(line_ids)
+            
+            split_idx = int(len(line_ids) * config.train_ratio)
+            train_ids = line_ids[:split_idx]
+            val_ids = line_ids[split_idx:]
+            char_width_stats = None
     else:
-        print(f"[INFO] 从划分文件加载预计算的字符宽度统计")
+        if train_ids is None:
+            print("[INFO] 加载行ID列表...")
+            line_ids = load_all_line_ids(data_base_path)
+            print(f"[INFO] 找到 {len(line_ids)} 个行图像")
+            
+            if len(line_ids) == 0:
+                print("[ERROR] 未找到训练数据")
+                return
+            
+            np.random.seed(config.seed)
+            np.random.shuffle(line_ids)
+            
+            split_idx = int(len(line_ids) * config.train_ratio)
+            train_ids = line_ids[:split_idx]
+            val_ids = line_ids[split_idx:]
+            
+            print(f"[WARNING] 划分文件不存在，动态生成划分")
+            print(f"[INFO] 使用种子: {config.seed}")
+        else:
+            print(f"[INFO] 从划分文件加载预计算的字符宽度统计")
     
     print(f"[INFO] 训练集: {len(train_ids)} 样本")
     print(f"[INFO] 验证集: {len(val_ids)} 样本")
