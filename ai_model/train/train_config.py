@@ -50,3 +50,5 @@ class FineTuneConfig(TrainConfig):
     freeze_layers: bool = False
     
     fine_tune_lr: float = 1e-5
+    
+    no_validation: bool = False

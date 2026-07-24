@@ -112,6 +112,7 @@ def main(config: FineTuneConfig = None):
     print(f"  - 数据集划分文件: {split_path}")
     print(f"  - 预训练模型: {config.pretrained_model_path}")
     print(f"  - 冻结编码器: {config.freeze_layers}")
+    print(f"  - 无验证模式: {config.no_validation}")
     
     train_ids, val_ids, char_width_stats = load_dataset_split(config)
     
@@ -121,21 +122,26 @@ def main(config: FineTuneConfig = None):
         print(f"[INFO] 使用标注数据，过滤行ID...")
         print(f"[INFO] 标注数据包含 {len(annotation_line_ids)} 条记录")
         
-        if train_ids is not None:
-            train_ids = [lid for lid in train_ids if lid in annotation_line_ids]
-            val_ids = [lid for lid in val_ids if lid in annotation_line_ids]
-            print(f"[INFO] 从划分文件过滤后: 训练集 {len(train_ids)}, 验证集 {len(val_ids)}")
-        
-        if len(train_ids) == 0 or len(val_ids) == 0:
-            print(f"[WARNING] 过滤后样本不足，重新划分标注数据")
-            line_ids = list(annotation_line_ids)
-            np.random.seed(config.seed)
-            np.random.shuffle(line_ids)
+        if config.no_validation:
+            train_ids = list(annotation_line_ids)
+            val_ids = []
+            print(f"[INFO] 无验证模式: 全部 {len(train_ids)} 条数据用于训练")
+        else:
+            if train_ids is not None:
+                train_ids = [lid for lid in train_ids if lid in annotation_line_ids]
+                val_ids = [lid for lid in val_ids if lid in annotation_line_ids]
+                print(f"[INFO] 从划分文件过滤后: 训练集 {len(train_ids)}, 验证集 {len(val_ids)}")
             
-            split_idx = int(len(line_ids) * config.train_ratio)
-            train_ids = line_ids[:split_idx]
-            val_ids = line_ids[split_idx:]
-            char_width_stats = None
+            if len(train_ids) == 0 or len(val_ids) == 0:
+                print(f"[WARNING] 过滤后样本不足，重新划分标注数据")
+                line_ids = list(annotation_line_ids)
+                np.random.seed(config.seed)
+                np.random.shuffle(line_ids)
+                
+                split_idx = int(len(line_ids) * config.train_ratio)
+                train_ids = line_ids[:split_idx]
+                val_ids = line_ids[split_idx:]
+                char_width_stats = None
     else:
         if train_ids is None:
             print("[INFO] 加载行ID列表...")
@@ -146,16 +152,23 @@ def main(config: FineTuneConfig = None):
                 print("[ERROR] 未找到训练数据")
                 return
             
-            np.random.seed(config.seed)
-            np.random.shuffle(line_ids)
-            
-            split_idx = int(len(line_ids) * config.train_ratio)
-            train_ids = line_ids[:split_idx]
-            val_ids = line_ids[split_idx:]
-            
-            print(f"[WARNING] 划分文件不存在，动态生成划分")
-            print(f"[INFO] 使用种子: {config.seed}")
+            if config.no_validation:
+                train_ids = line_ids
+                val_ids = []
+                print(f"[INFO] 无验证模式: 全部 {len(train_ids)} 条数据用于训练")
+            else:
+                np.random.seed(config.seed)
+                np.random.shuffle(line_ids)
+                
+                split_idx = int(len(line_ids) * config.train_ratio)
+                train_ids = line_ids[:split_idx]
+                val_ids = line_ids[split_idx:]
+                
+                print(f"[WARNING] 划分文件不存在，动态生成划分")
+                print(f"[INFO] 使用种子: {config.seed}")
         else:
+            if config.no_validation:
+                val_ids = []
             print(f"[INFO] 从划分文件加载预计算的字符宽度统计")
     
     print(f"[INFO] 训练集: {len(train_ids)} 样本")
@@ -231,23 +244,31 @@ def main(config: FineTuneConfig = None):
         model_name=config.model_name,
         lr_scheduler_type=config.lr_scheduler_type,
         global_char_width=global_char_width,
-        mode="微调"
+        mode="微调",
+        no_validation=config.no_validation
     )
     
     print("[INFO] 微调完成")
     
     save_model_and_history(model, history, config.checkpoint_dir, config.model_name, "finetune_history.json")
     
-    print("\n[INFO] 验证集最终评估:")
-    model.load_state_dict(torch.load(str(Path(config.checkpoint_dir) / f"{config.model_name}_best.pth"), weights_only=True))
-    results = evaluate_model(model, val_loader, criterion, device, device_type, config.use_amp, global_char_width)
-    
-    print(f"  损失: {results['loss']:.4f}")
-    print(f"  列级准确率: {results['col_acc']:.4f}")
-    print(f"  区间IoU: {results['iou']:.4f}")
-    print(f"  ROI-IoU: {results['roi_iou']:.4f}")
-    print(f"  Char-IoU: {results['char_iou']:.4f}")
-    print(f"  Gap-IoU: {results['gap_iou']:.4f}")
+    if not config.no_validation:
+        print("\n[INFO] 验证集最终评估:")
+        best_path = Path(config.checkpoint_dir) / f"{config.model_name}_best.pth"
+        if best_path.exists():
+            model.load_state_dict(torch.load(str(best_path), weights_only=True))
+            results = evaluate_model(model, val_loader, criterion, device, device_type, config.use_amp, global_char_width)
+            
+            print(f"  损失: {results['loss']:.4f}")
+            print(f"  列级准确率: {results['col_acc']:.4f}")
+            print(f"  区间IoU: {results['iou']:.4f}")
+            print(f"  ROI-IoU: {results['roi_iou']:.4f}")
+            print(f"  Char-IoU: {results['char_iou']:.4f}")
+            print(f"  Gap-IoU: {results['gap_iou']:.4f}")
+        else:
+            print("[INFO] 无最佳模型文件（无验证模式）")
+    else:
+        print("[INFO] 无验证模式，跳过验证集评估")
 
 
 if __name__ == "__main__":
@@ -275,10 +296,12 @@ if __name__ == "__main__":
                   help="是否冻结编码器层，只训练解码器（微调时使用）")
     @click.option("--fine-tune-lr", type=float, default=1e-5, show_default=True,
                   help="微调时使用的学习率")
+    @click.option("--no-validation/--with-validation", default=False,
+                  help="是否使用全部数据训练（无验证集）")
     def cli(batch_size, num_epochs, train_ratio,
             device, num_workers, use_amp, checkpoint_dir,
             data_base_path, annotations_file, split_file, seed,
-            pretrained_model_path, freeze_layers, fine_tune_lr):
+            pretrained_model_path, freeze_layers, fine_tune_lr, no_validation):
         cfg = FineTuneConfig(
             batch_size=batch_size,
             num_epochs=num_epochs,
@@ -293,7 +316,8 @@ if __name__ == "__main__":
             seed=seed,
             pretrained_model_path=pretrained_model_path,
             freeze_layers=freeze_layers,
-            fine_tune_lr=fine_tune_lr
+            fine_tune_lr=fine_tune_lr,
+            no_validation=no_validation
         )
         main(cfg)
     

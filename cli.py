@@ -441,8 +441,52 @@ def project_infer(project_id, model_path, data_base_path, batch_size, threshold)
         click.echo(f"[ERROR] 模型文件不存在: {model_file}", err=True)
         sys.exit(1)
     
+    global_char_width = 0.0
+    annotations_dir = project_root / "annotations"
+    if annotations_dir.exists():
+        all_widths = []
+        for f in annotations_dir.glob('*.json'):
+            try:
+                with open(f, 'r', encoding='utf-8') as fp:
+                    data = json.load(fp)
+                    if 'chars' in data:
+                        for char in data['chars']:
+                            w = char.get('width', 0)
+                            if w >= 3 and w <= 100:
+                                all_widths.append(w)
+            except Exception:
+                pass
+        
+        if len(all_widths) > 0:
+            global_char_width = float(np.median(all_widths))
+            click.echo(f"[INFO] 从标注数据计算全局中位字符宽度: {global_char_width:.2f} px")
+        else:
+            click.echo(f"[WARN] 标注目录为空，无法计算全局字符宽度")
+    
+    if global_char_width <= 0:
+        rule_jsons_dir = data_path / "rule_jsons"
+        if rule_jsons_dir.exists():
+            all_widths = []
+            for line_id in line_ids[:100]:
+                f = rule_jsons_dir / f"{line_id}_rule.json"
+                if f.exists():
+                    try:
+                        with open(f, 'r', encoding='utf-8') as fp:
+                            data = json.load(fp)
+                            if 'chars' in data:
+                                for char in data['chars']:
+                                    w = char.get('width', 0)
+                                    if w >= 3 and w <= 100:
+                                        all_widths.append(w)
+                    except Exception:
+                        pass
+            
+            if len(all_widths) > 0:
+                global_char_width = float(np.median(all_widths))
+                click.echo(f"[INFO] 从规则切割数据计算全局中位字符宽度: {global_char_width:.2f} px")
+    
     click.echo(f"[INFO] 加载模型: {model_file}")
-    predictor = CharSegmentPredictor(model_file)
+    predictor = CharSegmentPredictor(model_file, global_char_width=global_char_width)
     
     model_jsons_dir = project_root / "model_jsons"
     model_jsons_dir.mkdir(parents=True, exist_ok=True)

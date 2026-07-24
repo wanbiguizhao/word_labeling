@@ -253,34 +253,34 @@ class SequenceDecoder:
         return cleaned
     
     @staticmethod
-    def _filter_small_intervals(intervals: List[Tuple[int, int]], min_width: int = 2) -> List[Tuple[int, int]]:
+    def _filter_small_intervals(intervals: List[Tuple[int, int]], min_width: int = 2, 
+                                global_char_width: float = 0) -> List[Tuple[int, int]]:
         """
         过滤宽度过小的区间
         
         模型可能预测出宽度为0或1的噪声区间，这些区间应该被过滤掉。
-        但宽度为1的区间如果是共享边界（与其他区间相邻），则应该保留。
+        如果提供了全局字符宽度，则使用动态阈值（全局字符宽度的20%）。
         
         Args:
             intervals: 区间列表
-            min_width: 最小宽度阈值
+            min_width: 最小宽度阈值（当global_char_width为0时使用）
+            global_char_width: 全局字符宽度，用于计算动态阈值
         
         Returns:
             filtered_intervals: 过滤后的区间列表
         """
-        if len(intervals) <= 1:
-            return [(start, end) for start, end in intervals if end - start >= min_width]
+        if len(intervals) == 0:
+            return []
         
-        all_start_positions = set(s for s, e in intervals)
-        all_end_positions = set(e for s, e in intervals)
+        effective_min_width = min_width
+        if global_char_width > 0:
+            effective_min_width = max(min_width, int(global_char_width * 0.2))
         
         filtered = []
         for start, end in intervals:
             width = end - start
-            if width >= min_width:
+            if width >= effective_min_width:
                 filtered.append((start, end))
-            elif width == 1:
-                if start in all_end_positions or end in all_start_positions:
-                    filtered.append((start, end))
         
         return filtered
     
@@ -318,7 +318,7 @@ class SequenceDecoder:
 
 
 class CharSegmentPredictor:
-    def __init__(self, model_path: Path, device: str = 'auto'):
+    def __init__(self, model_path: Path, device: str = 'auto', global_char_width: float = 0):
         if device == 'auto':
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
@@ -346,6 +346,7 @@ class CharSegmentPredictor:
         self.prob_height = 51
         self.prob_max_pixel = 50
         self.threshold = 0.5
+        self.global_char_width = global_char_width
     
     def predict(self, line_img: np.ndarray) -> Tuple[List[Tuple[int, int]], np.ndarray, np.ndarray, float]:
         """
@@ -382,7 +383,8 @@ class CharSegmentPredictor:
         
         intervals = SequenceDecoder.decode(pred_class, pred_prob)
         
-        intervals = SequenceDecoder._filter_small_intervals(intervals, min_width=2)
+        intervals = SequenceDecoder._filter_small_intervals(intervals, min_width=2, 
+                                                           global_char_width=self.global_char_width)
         
         inv_scale = 1.0 / scale if scale > 0 else 1.0
         intervals_orig = [

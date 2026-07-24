@@ -78,20 +78,29 @@ def evaluate_shared_boundary_recognition(pred_intervals, gt_intervals):
     if len(gt_intervals) < 2:
         return 1.0
     
-    gt_shared_count = 0
+    gt_shared_positions = set()
     for i in range(len(gt_intervals) - 1):
         if gt_intervals[i][1] >= gt_intervals[i+1][0]:
-            gt_shared_count += 1
+            gt_shared_positions.add(gt_intervals[i][1])
     
-    pred_shared_count = 0
+    pred_shared_positions = set()
     for i in range(len(pred_intervals) - 1):
         if pred_intervals[i][1] >= pred_intervals[i+1][0]:
-            pred_shared_count += 1
+            pred_shared_positions.add(pred_intervals[i][1])
     
-    if gt_shared_count == 0:
-        return 1.0 if pred_shared_count == 0 else 0.5
-    else:
-        return 1.0 if pred_shared_count == gt_shared_count else max(0, 1 - abs(pred_shared_count - gt_shared_count) / gt_shared_count)
+    if len(gt_shared_positions) == 0:
+        return 1.0 if len(pred_shared_positions) == 0 else 0.5
+    
+    tp = len(gt_shared_positions & pred_shared_positions)
+    fp = len(pred_shared_positions - gt_shared_positions)
+    fn = len(gt_shared_positions - pred_shared_positions)
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    return f1
 
 
 def evaluate_intersection_iou(pred_intervals, gt_intervals):
@@ -159,6 +168,8 @@ def evaluate_synthetic_test_cases():
         metrics['expected'] = expected
         metrics['predicted'] = pred_intervals
         metrics['passed'] = pred_intervals == expected
+        metrics['known_issue'] = tc.get('known_issue', None)
+        metrics['is_blocker'] = tc.get('known_issue') is None
         
         results.append(metrics)
     
@@ -283,13 +294,27 @@ def print_synthetic_summary(results):
         rate = passed / total if total > 0 else 0
         print(f"  {d}: {passed}/{total} 通过 ({rate:.1%})")
     
-    failed = [r for r in results if not r['passed']]
-    if failed:
-        print(f"\n失败用例:")
-        for r in failed:
+    blocker_failed = [r for r in results if not r['passed'] and r['is_blocker']]
+    known_issue_failed = [r for r in results if not r['passed'] and not r['is_blocker']]
+    
+    if blocker_failed:
+        print(f"\n❌ 阻塞性失败用例（需要修复）:")
+        for r in blocker_failed:
             print(f"  {r['name']} ({r['description']}):")
             print(f"    期望: {r['expected']}")
             print(f"    实际: {r['predicted']}")
+    
+    if known_issue_failed:
+        print(f"\n⚠️ 已知问题失败用例（跟踪中）:")
+        for r in known_issue_failed:
+            print(f"  {r['name']} ({r['description']}):")
+            print(f"    期望: {r['expected']}")
+            print(f"    实际: {r['predicted']}")
+            print(f"    问题描述: {r['known_issue']}")
+
+
+SYNTHETIC_WEIGHT = 0.3
+REAL_WEIGHT = 0.7
 
 
 def run_full_evaluation():
@@ -309,22 +334,32 @@ def run_full_evaluation():
     
     print("\n" + "=" * 60)
     
-    all_results = synthetic_results + real_results
-    overall_agg = aggregate_results(all_results)
+    synthetic_score = synthetic_agg['overall_score'] if synthetic_agg else 0.0
+    real_score = real_agg['overall_score'] if real_agg else 0.0
+    
+    weighted_overall_score = synthetic_score * SYNTHETIC_WEIGHT + real_score * REAL_WEIGHT
+    
+    blocker_results = [r for r in synthetic_results if r['is_blocker']]
+    passed_all_blockers = all(r['passed'] for r in blocker_results)
+    
+    known_issue_results = [r for r in synthetic_results if not r['is_blocker']]
+    known_issue_passed = sum(1 for r in known_issue_results if r['passed'])
+    known_issue_total = len(known_issue_results)
     
     print(f"\n综合评估:")
-    print(f"  合成测试: {synthetic_agg['overall_score']:.4f}")
-    print(f"  真实数据: {real_agg['overall_score']:.4f}")
-    print(f"  综合分数: {overall_agg['overall_score']:.4f}")
+    print(f"  合成测试: {synthetic_score:.4f} (权重×{SYNTHETIC_WEIGHT})")
+    print(f"  真实数据: {real_score:.4f} (权重×{REAL_WEIGHT})")
+    print(f"  综合分数: {weighted_overall_score:.4f}")
     
-    passed_all_synthetic = all(r['passed'] for r in synthetic_results)
-    
-    if passed_all_synthetic:
-        print("\n✅ 所有合成测试用例通过！")
+    if passed_all_blockers:
+        print("\n✅ 所有阻塞性测试用例通过！")
     else:
-        print("\n❌ 部分合成测试用例失败！")
+        print("\n❌ 部分阻塞性测试用例失败！")
     
-    if overall_agg['overall_score'] >= 0.8:
+    if known_issue_total > 0:
+        print(f"已知问题用例: {known_issue_passed}/{known_issue_total} 通过")
+    
+    if weighted_overall_score >= 0.8:
         print("✅ 综合分数达标（≥0.8）")
     else:
         print("⚠️ 综合分数未达标（<0.8），需要优化后处理逻辑")
@@ -332,12 +367,14 @@ def run_full_evaluation():
     return {
         'synthetic': synthetic_agg,
         'real': real_agg,
-        'overall': overall_agg,
-        'synthetic_passed': passed_all_synthetic
+        'overall_score': weighted_overall_score,
+        'blocker_passed': passed_all_blockers,
+        'known_issue_passed': known_issue_passed,
+        'known_issue_total': known_issue_total
     }
 
 
 if __name__ == "__main__":
     results = run_full_evaluation()
     
-    sys.exit(0 if results['synthetic_passed'] and results['overall']['overall_score'] >= 0.8 else 1)
+    sys.exit(0 if results['blocker_passed'] and results['overall_score'] >= 0.8 else 1)

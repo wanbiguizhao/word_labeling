@@ -137,7 +137,8 @@ def train_model(
     model_name: str,
     lr_scheduler_type: str,
     global_char_width: float = 16.0,
-    mode: str = "train"
+    mode: str = "train",
+    no_validation: bool = False
 ) -> Dict:
     best_val_loss = float('inf')
     history = {
@@ -166,14 +167,22 @@ def train_model(
         
         history['learning_rate'].append(current_lr)
         
-        val_loss, val_col_acc, val_iou, val_roi_iou, val_char_iou, val_gap_iou = validate_epoch(
-            model, val_loader, criterion, device, device_type, use_amp, global_char_width
-        )
-        
-        if lr_scheduler_type == "cosine":
-            scheduler.step(epoch)
+        if no_validation:
+            val_loss, val_col_acc, val_iou, val_roi_iou, val_char_iou, val_gap_iou = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            
+            if lr_scheduler_type == "cosine":
+                scheduler.step(epoch)
+            else:
+                scheduler.step(train_loss)
         else:
-            scheduler.step(val_loss)
+            val_loss, val_col_acc, val_iou, val_roi_iou, val_char_iou, val_gap_iou = validate_epoch(
+                model, val_loader, criterion, device, device_type, use_amp, global_char_width
+            )
+            
+            if lr_scheduler_type == "cosine":
+                scheduler.step(epoch)
+            else:
+                scheduler.step(val_loss)
         
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
@@ -189,21 +198,25 @@ def train_model(
             epoch_str = f"Epoch [{epoch+1}/{num_epochs}]"
             lr_str = f"LR={current_lr:.2e}"
             train_str = f"Train: Loss={train_loss:.4f}, ColAcc={train_col_acc:.4f}, IoU={train_iou:.4f}"
-            val_str = f"Val:   Loss={val_loss:.4f}, ColAcc={val_col_acc:.4f}, IoU={val_iou:.4f}"
-            val_roi_str = f"ROI-IoU={val_roi_iou:.4f}, Char-IoU={val_char_iou:.4f}, Gap-IoU={val_gap_iou:.4f}"
             
             if HAS_TQDM:
                 epoch_range.write(f"\n{epoch_str} | {lr_str}")
                 epoch_range.write(f"  {train_str}")
-                epoch_range.write(f"  {val_str}")
-                epoch_range.write(f"  {val_roi_str}")
+                if not no_validation:
+                    val_str = f"Val:   Loss={val_loss:.4f}, ColAcc={val_col_acc:.4f}, IoU={val_iou:.4f}"
+                    val_roi_str = f"ROI-IoU={val_roi_iou:.4f}, Char-IoU={val_char_iou:.4f}, Gap-IoU={val_gap_iou:.4f}"
+                    epoch_range.write(f"  {val_str}")
+                    epoch_range.write(f"  {val_roi_str}")
             else:
                 print(f"{epoch_str} | {lr_str}")
                 print(f"  {train_str}")
-                print(f"  {val_str}")
-                print(f"  {val_roi_str}")
+                if not no_validation:
+                    val_str = f"Val:   Loss={val_loss:.4f}, ColAcc={val_col_acc:.4f}, IoU={val_iou:.4f}"
+                    val_roi_str = f"ROI-IoU={val_roi_iou:.4f}, Char-IoU={val_char_iou:.4f}, Gap-IoU={val_gap_iou:.4f}"
+                    print(f"  {val_str}")
+                    print(f"  {val_roi_str}")
         
-        if val_loss < best_val_loss:
+        if not no_validation and val_loss < best_val_loss:
             best_val_loss = val_loss
             best_path = model_dir / f"{model_name}_best.pth"
             torch.save(model.state_dict(), str(best_path))
@@ -214,10 +227,16 @@ def train_model(
                 print(f"  [INFO] 保存最佳模型: {best_path}")
         
         if HAS_TQDM:
-            epoch_range.set_postfix({
-                "Val Loss": f"{val_loss:.4f}",
-                "Val IoU": f"{val_iou:.4f}"
-            })
+            if no_validation:
+                epoch_range.set_postfix({
+                    "Train Loss": f"{train_loss:.4f}",
+                    "Train IoU": f"{train_iou:.4f}"
+                })
+            else:
+                epoch_range.set_postfix({
+                    "Val Loss": f"{val_loss:.4f}",
+                    "Val IoU": f"{val_iou:.4f}"
+                })
     
     return history
 

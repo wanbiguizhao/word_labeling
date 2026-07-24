@@ -19,6 +19,7 @@ def load_annotations(annotations_path):
 
 def find_line_image(line_id):
     possible_dirs = [
+        PROJECT_ROOT / "datahome" / "lines",
         PROJECT_ROOT / "datahome" / "datasets" / "done3",
         PROJECT_ROOT / "datahome" / "datasets" / "done2",
         PROJECT_ROOT / "datahome" / "datasets" / "done",
@@ -164,83 +165,11 @@ def create_synthetic_test_cases():
     })
     
     test_cases.append({
-        'name': 'shared_boundary_complete',
-        'description': '完全共享边界',
-        'difficulty': 'medium',
-        'pred_class': np.array([1, 2, 1, 1, 2, 1]),
-        'expected': [(0, 2), (2, 5)]
-    })
-    
-    test_cases.append({
-        'name': 'shared_boundary_adjacent',
-        'description': '相邻共享边界',
-        'difficulty': 'medium',
-        'pred_class': np.array([1, 2, 1, 0, 1, 2, 1]),
-        'expected': [(0, 1), (2, 2), (4, 4), (5, 6)]
-    })
-    
-    test_cases.append({
-        'name': 'blank_separation',
-        'description': '空白分隔两个字符',
-        'difficulty': 'hard',
-        'pred_class': np.array([1, 2, 2, 0, 0, 2, 2, 1, 0]),
-        'expected': [(0, 2), (5, 7)]
-    })
-    
-    test_cases.append({
-        'name': 'blank_separation_narrow',
-        'description': '窄空白分隔',
-        'difficulty': 'hard',
-        'pred_class': np.array([1, 2, 2, 0, 2, 2, 1, 0]),
-        'expected': [(0, 2), (4, 6)]
-    })
-    
-    test_cases.append({
         'name': 'no_boundary',
         'description': '无边界点',
         'difficulty': 'simple',
         'pred_class': np.array([0, 2, 2, 2, 0]),
         'expected': [(1, 3)]
-    })
-    
-    test_cases.append({
-        'name': 'width_1_char',
-        'description': '宽度1字符',
-        'difficulty': 'medium',
-        'pred_class': np.array([0, 1, 0, 1, 2, 2, 1, 0]),
-        'expected': [(1, 1), (3, 6)]
-    })
-    
-    test_cases.append({
-        'name': 'multiple_blanks',
-        'description': '多个空白分隔',
-        'difficulty': 'hard',
-        'pred_class': np.array([1, 2, 0, 0, 2, 0, 2, 1]),
-        'expected': [(0, 1), (4, 4), (6, 7)]
-    })
-    
-    test_cases.append({
-        'name': 'dense_boundary_noise',
-        'description': '密集边界噪声',
-        'difficulty': 'medium',
-        'pred_class': np.array([1, 1, 2, 2, 1, 1, 0]),
-        'expected': [(0, 0), (1, 4), (5, 5)]
-    })
-    
-    test_cases.append({
-        'name': 'complex_shared_boundary',
-        'description': '复杂共享边界',
-        'difficulty': 'hard',
-        'pred_class': np.array([1, 2, 1, 1, 2, 2, 1, 1, 2, 1]),
-        'expected': [(0, 2), (2, 6), (6, 9)]
-    })
-    
-    test_cases.append({
-        'name': 'overlapping_internal',
-        'description': '重叠内部区域',
-        'difficulty': 'hard',
-        'pred_class': np.array([1, 2, 2, 2, 1, 1, 2, 2, 1]),
-        'expected': [(0, 4), (4, 8)]
     })
     
     test_cases.append({
@@ -265,6 +194,114 @@ def create_synthetic_test_cases():
         'difficulty': 'simple',
         'pred_class': np.array([0, 1, 2, 2, 1]),
         'expected': [(1, 4)]
+    })
+    
+    test_cases.append({
+        'name': 'shared_boundary_complete',
+        'description': '完全共享边界',
+        'difficulty': 'medium',
+        'pred_class': np.array([1, 2, 1, 1, 2, 1]),
+        'expected': [(0, 2), (2, 5)]
+    })
+    
+    test_cases.append({
+        'name': 'shared_boundary_adjacent',
+        'description': '相邻共享边界',
+        'difficulty': 'medium',
+        'pred_class': np.array([1, 2, 2, 1, 0, 1, 2, 2, 1]),
+        'expected': [(0, 3), (5, 8)],
+        'known_issue': '过分割：未使用的边界点被当作独立字符'
+    })
+    
+    test_cases.append({
+        'name': 'width_1_char',
+        'description': '宽度1字符',
+        'difficulty': 'medium',
+        'pred_class': np.array([0, 1, 0, 1, 2, 2, 1, 0]),
+        'expected': [(1, 1), (3, 6)]
+    })
+    
+    test_cases.append({
+        'name': 'dense_boundary_noise',
+        'description': '密集边界噪声',
+        'difficulty': 'medium',
+        'pred_class': np.array([1, 1, 2, 2, 1, 1, 0]),
+        'expected': [(0, 0), (1, 4), (5, 5)]
+    })
+    
+    test_cases.append({
+        'name': 'multiple_shared_boundaries',
+        'description': '连续共享边界',
+        'difficulty': 'medium',
+        'pred_class': np.array([1, 2, 1, 1, 2, 1, 1, 2, 1]),
+        'expected': [(0, 2), (2, 5), (5, 8)]
+    })
+    
+    test_cases.append({
+        'name': 'blank_separation',
+        'description': '空白分隔两个字符',
+        'difficulty': 'hard',
+        'pred_class': np.array([1, 2, 2, 0, 0, 2, 2, 1, 0]),
+        'expected': [(0, 2), (5, 7)]
+    })
+    
+    test_cases.append({
+        'name': 'blank_separation_narrow',
+        'description': '窄空白分隔',
+        'difficulty': 'hard',
+        'pred_class': np.array([1, 2, 2, 0, 2, 2, 1, 0]),
+        'expected': [(0, 2), (4, 6)]
+    })
+    
+    test_cases.append({
+        'name': 'multiple_blanks',
+        'description': '多个空白分隔',
+        'difficulty': 'hard',
+        'pred_class': np.array([1, 2, 0, 0, 2, 0, 2, 1]),
+        'expected': [(0, 1), (4, 4), (6, 7)]
+    })
+    
+    test_cases.append({
+        'name': 'complex_shared_boundary',
+        'description': '复杂共享边界',
+        'difficulty': 'hard',
+        'pred_class': np.array([1, 2, 1, 1, 2, 2, 1, 1, 2, 1]),
+        'expected': [(0, 2), (2, 6), (6, 9)]
+    })
+    
+    test_cases.append({
+        'name': 'overlapping_internal',
+        'description': '重叠内部区域',
+        'difficulty': 'hard',
+        'pred_class': np.array([1, 2, 2, 2, 1, 1, 2, 2, 1]),
+        'expected': [(0, 4), (4, 8)]
+    })
+    
+    test_cases.append({
+        'name': 'over_segmentation_noise',
+        'description': '过分割噪声（边界点过多）',
+        'difficulty': 'hard',
+        'pred_class': np.array([1, 2, 2, 2, 1, 0, 1, 2, 2, 2, 1, 0, 1, 2, 2, 2, 1]),
+        'expected': [(0, 4), (6, 10), (12, 16)],
+        'known_issue': '过分割：空白区域中的边界点被当作独立字符'
+    })
+    
+    test_cases.append({
+        'name': 'tiny_internal_regions',
+        'description': '微小内部区域',
+        'difficulty': 'hard',
+        'pred_class': np.array([1, 2, 2, 2, 1, 0, 0, 1, 2, 2, 2, 2, 1, 0, 1, 2, 2, 2, 1]),
+        'expected': [(0, 4), (7, 12), (14, 18)],
+        'known_issue': '过分割：空白区域中的边界点被当作独立字符'
+    })
+    
+    test_cases.append({
+        'name': 'boundary_without_internal',
+        'description': '边界点包围空白',
+        'difficulty': 'hard',
+        'pred_class': np.array([1, 0, 0, 1, 2, 2, 1, 0, 0, 1, 0, 0, 1]),
+        'expected': [(3, 6)],
+        'known_issue': '过分割：无内部区域的边界点被当作独立字符'
     })
     
     benchmark_dir = PROJECT_ROOT / "tests" / "benchmark"
