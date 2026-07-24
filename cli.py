@@ -133,10 +133,12 @@ def train_pretrain(batch_size, learning_rate, num_epochs, train_ratio,
               help="是否冻结编码器层，只训练解码器（微调时使用）")
 @click.option("--fine-tune-lr", type=float, default=1e-5, show_default=True,
               help="微调时使用的学习率")
+@click.option("--no-validation/--with-validation", default=False,
+              help="是否使用全部数据训练（无验证集）")
 def train_finetune(batch_size, num_epochs, train_ratio,
                    device, num_workers, use_amp, checkpoint_dir,
                    data_base_path, dataset, split_file, seed,
-                   pretrained_model, freeze_layers, fine_tune_lr):
+                   pretrained_model, freeze_layers, fine_tune_lr, no_validation):
     """微调分割模型（使用合并标注数据）"""
     from ai_model.train.train_config import FineTuneConfig
     from ai_model.train.finetune import main as finetune_main
@@ -155,7 +157,8 @@ def train_finetune(batch_size, num_epochs, train_ratio,
         seed=seed,
         pretrained_model_path=pretrained_model,
         freeze_layers=freeze_layers,
-        fine_tune_lr=fine_tune_lr
+        fine_tune_lr=fine_tune_lr,
+        no_validation=no_validation
     )
     finetune_main(cfg)
 
