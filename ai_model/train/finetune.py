@@ -51,17 +51,41 @@ def load_pretrained_model(model: nn.Module, config: FineTuneConfig, device: torc
     model_path = base_dir / config.pretrained_model_path
     
     if model_path.exists():
-        model.load_state_dict(torch.load(str(model_path), map_location=device, weights_only=True))
+        checkpoint = torch.load(str(model_path), map_location=device, weights_only=True)
+        
+        model_state_dict = model.state_dict()
+        checkpoint_keys = set(checkpoint.keys())
+        model_keys = set(model_state_dict.keys())
+        
+        matching_keys = checkpoint_keys & model_keys
+        mismatched_keys = checkpoint_keys - model_keys
+        missing_keys = model_keys - checkpoint_keys
+        
+        if mismatched_keys:
+            print(f"[WARNING] 预训练模型中有但当前模型中没有的参数（可能是输出层差异）: {mismatched_keys}")
+        if missing_keys:
+            print(f"[WARNING] 当前模型中有但预训练模型中没有的参数: {missing_keys}")
+        
+        filtered_checkpoint = {}
+        for key in checkpoint:
+            if key in model_state_dict and checkpoint[key].shape == model_state_dict[key].shape:
+                filtered_checkpoint[key] = checkpoint[key]
+        
+        model.load_state_dict(filtered_checkpoint, strict=False)
+        
         print(f"[INFO] 加载预训练模型: {model_path}")
+        print(f"[INFO] 成功加载 {len(filtered_checkpoint)} 个参数")
+        if len(filtered_checkpoint) < len(checkpoint):
+            print(f"[INFO] 跳过 {len(checkpoint) - len(filtered_checkpoint)} 个不匹配的参数（输出层）")
     else:
         print(f"[WARNING] 预训练模型路径不存在: {model_path}")
         print("[INFO] 将从头开始训练")
 
 
 def freeze_encoder(model: nn.Module):
-    print("[INFO] 冻结编码器层，只训练解码器...")
+    print("[INFO] 冻结编码器层，只训练解码器和输出层...")
     for name, param in model.named_parameters():
-        if 'decoder' not in name.lower():
+        if 'decoder' not in name.lower() and 'outc' not in name.lower():
             param.requires_grad = False
 
 

@@ -17,7 +17,7 @@ from ai_model.data.dataset import FeatureExtractor
 
 class SequenceDecoder:
     @staticmethod
-    def decode(pred_class: np.ndarray, boundary_threshold: float = 0.5) -> List[Tuple[int, int]]:
+    def decode(pred_class: np.ndarray, pred_prob: Optional[np.ndarray] = None, boundary_threshold: float = 0.3) -> List[Tuple[int, int]]:
         """
         从3类序列预测结果解码字符区间（支持共享边界）
         
@@ -32,6 +32,8 @@ class SequenceDecoder:
             3. 每个内部类区域向右扩展到最近的边界点(1)或图像宽度-1
             4. 处理没有内部类的边界点对（宽度1或2的字符）
             5. 支持共享边界：位置N同时是上一个字符的结束和下一个字符的开始
+            6. 后处理：过滤无效区间、合并重叠区间、去除重复边界
+            7. 概率加权去重：在密集边界区域，保留概率最高的边界点
         
         示例：
             正常字符：[1,2,2,1] → 内部区域[1-2] → 扩展到边界(0,3)
@@ -40,13 +42,20 @@ class SequenceDecoder:
         
         Args:
             pred_class: 预测类别数组（0/1/2），长度=图像宽度
-            boundary_threshold: 边界置信度阈值（当前版本未使用，预留）
+            pred_prob: softmax后概率数组（3通道：[空白概率, 边界概率, 内部概率]），可选，用于概率加权去重
+            boundary_threshold: 边界置信度阈值，低于此阈值的边界点将被过滤
         
         Returns:
             intervals: [(start_col, end_col), ...] 字符区间列表
         """
         boundary_cols = np.where(pred_class == 1)[0]
         internal_cols = np.where(pred_class == 2)[0]
+        
+        if pred_prob is not None and pred_prob.shape[0] >= 2:
+            boundary_probs = pred_prob[1, :]
+            boundary_cols = SequenceDecoder._dedupe_boundaries(boundary_cols, boundary_probs, threshold=boundary_threshold)
+        else:
+            boundary_cols = SequenceDecoder._dedupe_boundaries(boundary_cols)
         
         if len(boundary_cols) == 0:
             return SequenceDecoder._decode_from_internal(pred_class)
@@ -66,12 +75,35 @@ class SequenceDecoder:
                     prev = col
             internal_regions.append((start, prev))
             
-            for region_start, region_end in internal_regions:
+            n_regions = len(internal_regions)
+            for i, (region_start, region_end) in enumerate(internal_regions):
                 left_boundary = boundary_cols[boundary_cols <= region_start]
                 start_col = left_boundary[-1] if len(left_boundary) > 0 else region_start
                 
                 right_boundary = boundary_cols[boundary_cols >= region_end]
                 end_col = right_boundary[0] if len(right_boundary) > 0 else region_end
+                
+                if i > 0:
+                    prev_region_end = internal_regions[i-1][1]
+                    gap_start = prev_region_end + 1
+                    gap_end = region_start - 1
+                    if gap_start <= gap_end:
+                        has_blank = np.any(pred_class[gap_start:gap_end+1] == 0)
+                        if has_blank:
+                            start_col = max(start_col, gap_end + 1)
+                        else:
+                            prev_end_boundary = boundary_cols[boundary_cols >= prev_region_end]
+                            if len(prev_end_boundary) > 0:
+                                start_col = prev_end_boundary[0]
+                
+                if i < n_regions - 1:
+                    next_region_start = internal_regions[i+1][0]
+                    gap_start = region_end + 1
+                    gap_end = next_region_start - 1
+                    if gap_start <= gap_end:
+                        has_blank = np.any(pred_class[gap_start:gap_end+1] == 0)
+                        if has_blank:
+                            end_col = min(end_col, gap_start - 1)
                 
                 intervals.append((start_col, end_col))
         
@@ -91,21 +123,27 @@ class SequenceDecoder:
                 start = boundary_cols[i]
                 end = boundary_cols[i + 1]
                 
-                gap_has_blank = False
-                for col in range(start + 1, end):
-                    if pred_class[col] == 0:
-                        gap_has_blank = True
-                        break
-                
-                if not gap_has_blank:
+                if end - start == 1:
                     intervals.append((start, end))
                     used_boundaries.add(start)
                     used_boundaries.add(end)
                     i += 2
                 else:
-                    intervals.append((start, start))
-                    used_boundaries.add(start)
-                    i += 1
+                    gap_has_blank = False
+                    for col in range(start + 1, end):
+                        if pred_class[col] == 0:
+                            gap_has_blank = True
+                            break
+                    
+                    if not gap_has_blank:
+                        intervals.append((start, end))
+                        used_boundaries.add(start)
+                        used_boundaries.add(end)
+                        i += 2
+                    else:
+                        intervals.append((start, start))
+                        used_boundaries.add(start)
+                        i += 1
             else:
                 intervals.append((boundary_cols[i], boundary_cols[i]))
                 used_boundaries.add(boundary_cols[i])
@@ -113,7 +151,138 @@ class SequenceDecoder:
         
         intervals.sort(key=lambda x: x[0])
         
-        return intervals
+        return SequenceDecoder._clean_intervals(intervals)
+    
+    @staticmethod
+    def _dedupe_boundaries(boundary_cols: np.ndarray, boundary_probs: Optional[np.ndarray] = None, 
+                          min_dist: int = 1, threshold: float = 0.3) -> np.ndarray:
+        """
+        概率加权去除重复的边界点
+        
+        当模型在相邻列预测多个边界(1)时，根据概率加权保留最可靠的边界点。
+        相邻边界点(间距=1)是合法的共享边界，表示两个字符之间的分界，不应被过滤。
+        只有完全相同的位置(间距=0)才需要去重。
+        
+        处理流程：
+            1. 过滤概率低于阈值的边界点（如果提供了概率）
+            2. 按概率降序排序
+            3. 贪心选择：保留概率最高的边界点，保证间距 >= min_dist(默认1)
+        
+        Args:
+            boundary_cols: 边界点列索引数组
+            boundary_probs: 边界点概率数组，长度与 boundary_cols 对应，可选
+            min_dist: 边界点之间的最小距离，默认1(允许相邻边界点)
+            threshold: 边界置信度阈值，低于此阈值的边界点将被过滤
+        
+        Returns:
+            deduplicated_cols: 去重后的边界点数组（已排序）
+        """
+        if len(boundary_cols) == 0:
+            return boundary_cols
+        
+        filtered_cols = boundary_cols.copy()
+        filtered_probs = None
+        
+        if boundary_probs is not None:
+            filtered_probs = boundary_probs[boundary_cols]
+            mask = filtered_probs >= threshold
+            filtered_cols = filtered_cols[mask]
+            filtered_probs = filtered_probs[mask]
+        
+        if len(filtered_cols) == 0:
+            return np.array([])
+        
+        if filtered_probs is not None:
+            sorted_idx = np.argsort(filtered_probs)[::-1]
+            sorted_cols = filtered_cols[sorted_idx]
+            
+            result = []
+            for col in sorted_cols:
+                if all(abs(col - r) >= min_dist for r in result):
+                    result.append(col)
+            
+            return np.array(sorted(result))
+        else:
+            result = [filtered_cols[0]]
+            for col in filtered_cols[1:]:
+                if col - result[-1] >= min_dist:
+                    result.append(col)
+            return np.array(result)
+    
+    @staticmethod
+    def _clean_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """
+        后处理：清理区间列表
+        
+        处理步骤：
+            1. 过滤无效区间（start >= end）
+            2. 合并重叠的区间（start <= current_end）
+            3. 保留相邻区间（start == current_end + 1）作为独立字符，这是合法的共享边界
+        
+        注意：相邻区间不合并，因为相邻边界点表示两个字符之间的共享边界。
+        例如：区间(534, 619)和(620, 661)表示两个独立字符，不应合并。
+        
+        Args:
+            intervals: 原始区间列表
+        
+        Returns:
+            cleaned_intervals: 清理后的区间列表
+        """
+        if len(intervals) == 0:
+            return []
+        
+        intervals.sort(key=lambda x: x[0])
+        
+        cleaned = []
+        current_start, current_end = intervals[0]
+        
+        for start, end in intervals[1:]:
+            if start > current_end + 1:
+                if current_end >= current_start:
+                    cleaned.append((current_start, current_end))
+                current_start, current_end = start, end
+            elif start == current_end + 1 or start == current_end:
+                cleaned.append((current_start, current_end))
+                current_start, current_end = start, end
+            else:
+                current_end = max(current_end, end)
+        
+        if current_end >= current_start:
+            cleaned.append((current_start, current_end))
+        
+        return cleaned
+    
+    @staticmethod
+    def _filter_small_intervals(intervals: List[Tuple[int, int]], min_width: int = 2) -> List[Tuple[int, int]]:
+        """
+        过滤宽度过小的区间
+        
+        模型可能预测出宽度为0或1的噪声区间，这些区间应该被过滤掉。
+        但宽度为1的区间如果是共享边界（与其他区间相邻），则应该保留。
+        
+        Args:
+            intervals: 区间列表
+            min_width: 最小宽度阈值
+        
+        Returns:
+            filtered_intervals: 过滤后的区间列表
+        """
+        if len(intervals) <= 1:
+            return [(start, end) for start, end in intervals if end - start >= min_width]
+        
+        all_start_positions = set(s for s, e in intervals)
+        all_end_positions = set(e for s, e in intervals)
+        
+        filtered = []
+        for start, end in intervals:
+            width = end - start
+            if width >= min_width:
+                filtered.append((start, end))
+            elif width == 1:
+                if start in all_end_positions or end in all_start_positions:
+                    filtered.append((start, end))
+        
+        return filtered
     
     @staticmethod
     def _decode_from_internal(pred_class: np.ndarray) -> List[Tuple[int, int]]:
@@ -156,7 +325,20 @@ class CharSegmentPredictor:
             self.device = torch.device(device)
         
         self.model = UNet1D(n_channels=6, n_classes=3).to(self.device)
-        self.model.load_state_dict(torch.load(str(model_path), map_location=self.device, weights_only=True))
+        
+        checkpoint = torch.load(str(model_path), map_location=self.device, weights_only=True)
+        model_state_dict = self.model.state_dict()
+        filtered_checkpoint = {}
+        
+        for key in checkpoint:
+            if key in model_state_dict and checkpoint[key].shape == model_state_dict[key].shape:
+                filtered_checkpoint[key] = checkpoint[key]
+        
+        self.model.load_state_dict(filtered_checkpoint, strict=False)
+        
+        if len(filtered_checkpoint) < len(checkpoint):
+            print(f"[WARNING] 跳过 {len(checkpoint) - len(filtered_checkpoint)} 个不匹配的参数（输出层）")
+        
         self.model.eval()
         
         self.max_width = 2048
@@ -198,7 +380,9 @@ class CharSegmentPredictor:
         
         pred_class = np.argmax(pred_prob, axis=0)
         
-        intervals = SequenceDecoder.decode(pred_class)
+        intervals = SequenceDecoder.decode(pred_class, pred_prob)
+        
+        intervals = SequenceDecoder._filter_small_intervals(intervals, min_width=2)
         
         inv_scale = 1.0 / scale if scale > 0 else 1.0
         intervals_orig = [

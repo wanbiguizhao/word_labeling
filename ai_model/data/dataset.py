@@ -402,9 +402,12 @@ class CharSegmentDataset(Dataset):
         
         if self._annotations is not None and line_id in self._annotations:
             image_path_str = self._annotations[line_id].get('image_path', '')
-            line_path = Path(image_path_str)
-            if not line_path.is_absolute():
-                line_path = self.data_base_path.parent / image_path_str.replace('\\', '/')
+            if image_path_str:
+                line_path = Path(image_path_str)
+                if not line_path.is_absolute():
+                    line_path = self.data_base_path.parent / image_path_str.replace('\\', '/')
+            else:
+                line_path = self.lines_dir / f"{line_id}.png"
         else:
             line_path = self.lines_dir / f"{line_id}.png"
         

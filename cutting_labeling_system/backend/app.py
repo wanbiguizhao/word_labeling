@@ -21,6 +21,11 @@ from annotation_registry import annotation_registry
 from project_service import project_service
 from selector_service import selector_service
 
+from ai_model.common.cut_line_converter import (
+    chars_to_lines as chars_to_lines_impl,
+    lines_to_chars as lines_to_chars_impl
+)
+
 app = FastAPI(title="汉字切割标注系统")
 
 app.add_middleware(
@@ -55,119 +60,36 @@ def chars_to_lines(chars: List[dict], image_width: int) -> List[dict]:
     """
     将字符区间转换为切割线（支持共享边界）
     
-    共享边界支持：
-        当 char1.col_end == char2.col_start 时，该位置只生成一条紫色线，
-        表示上一个字符的结束和下一个字符的开始。
-    
-    颜色定义：
-        red (#ff0000) = 字符开始线
-        green (#00ff00) = 字符结束线
-        purple (#9932cc) = 共享边界
+    使用 ai_model.common.cut_line_converter 中的公共实现，
+    确保前后端显示一致。
     
     Args:
         chars: 字符列表，每个包含 col_start, col_end
-        image_width: 图像宽度
+        image_width: 图像宽度（兼容参数，实际未使用）
     
     Returns:
         lines: 切割线列表，每个包含 pos, color
     """
-    all_starts = set()
-    all_ends = set()
-    
-    for char in chars:
-        col_start = char.get("col_start")
-        col_end = char.get("col_end")
-        if col_start is not None:
-            all_starts.add(col_start)
-        if col_end is not None:
-            all_ends.add(col_end)
-    
-    shared_boundaries = all_starts & all_ends
-    
-    line_dict = {}
-    
-    for char in chars:
-        col_start = char.get("col_start")
-        col_end = char.get("col_end")
-        
-        if col_start is not None:
-            if col_start in shared_boundaries:
-                line_dict[col_start] = "#9932cc"
-            elif col_start not in line_dict:
-                line_dict[col_start] = "red"
-        
-        if col_end is not None:
-            if col_end in shared_boundaries:
-                line_dict[col_end] = "#9932cc"
-            elif col_end not in line_dict:
-                line_dict[col_end] = "green"
-    
-    lines = [{"pos": pos, "color": color} for pos, color in line_dict.items()]
-    lines.sort(key=lambda x: x["pos"])
-    return lines
+    return chars_to_lines_impl(chars, color_format="hex")
 
 
-def lines_to_chars(lines: List[dict]) -> List[dict]:
+def lines_to_chars(lines: List[dict], image_width: int = 0) -> List[dict]:
     """
     将切割线转换为字符区间（支持共享边界）
     
-    颜色定义：
-        red (#ff0000) = 字符开始线
-        green (#00ff00) = 字符结束线
-        purple (#9932cc) = 共享边界（既是上一个字符的结束，也是下一个字符的开始）
-    
-    转换逻辑：
-        1. 遍历排序后的切割线
-        2. 遇到红色或紫色线 → 开始新字符的起始位置
-        3. 遇到绿色或紫色线 → 当前字符结束
-        4. 支持共享边界：紫色线同时作为上一个字符的结束和下一个字符的开始
+    使用 ai_model.common.cut_line_converter 中的公共实现，
+    确保前后端显示一致。
     
     Args:
         lines: 切割线列表，每个包含 pos, color
+        image_width: 图像宽度（兼容参数）
     
     Returns:
         chars: 字符列表，每个包含 col_start, col_end, width
     """
-    sorted_lines = sorted(lines, key=lambda x: x["pos"])
-    chars = []
-    
-    i = 0
-    n = len(sorted_lines)
-    
-    while i < n:
-        current_line = sorted_lines[i]
-        current_color = current_line.get("color", "#ff0000")
-        
-        if current_color in ["#ff0000", "red", "#9932cc", "purple"]:
-            col_start = current_line["pos"]
-            
-            j = i + 1
-            while j < n:
-                next_line = sorted_lines[j]
-                next_color = next_line.get("color", "#00ff00")
-                
-                if next_color in ["#00ff00", "green", "#9932cc", "purple"]:
-                    col_end = next_line["pos"]
-                    
-                    if col_end > col_start:
-                        chars.append({
-                            "col_start": col_start,
-                            "col_end": col_end,
-                            "width": col_end - col_start
-                        })
-                    
-                    if next_color in ["#ff0000", "red", "#9932cc", "purple"]:
-                        i = j
-                    else:
-                        i = j + 1
-                    break
-                
-                j += 1
-            else:
-                i += 1
-        else:
-            i += 1
-    
+    chars = lines_to_chars_impl(lines, image_width)
+    for char in chars:
+        char["width"] = char["col_end"] - char["col_start"]
     return chars
 
 

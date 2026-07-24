@@ -30,14 +30,21 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(BASE_DIR))
 
 from ai_model.inference.infer import CharSegmentPredictor
+from ai_model.common.cut_line_converter import (
+    intervals_to_positions,
+    START_COLOR_RGB,
+    END_COLOR_RGB,
+    SHARED_COLOR_RGB
+)
 
 
 # ===================== 可视化配置 =====================
 SEP_LINE_COLOR = (128, 0, 128)    # 紫色分隔线
 SEP_LINE_WIDTH = 2                 # 分隔线宽度
 CUT_LINE_WIDTH = 1                 # 切割线宽度
-START_COLOR = (255, 0, 0)          # 红色 = 字符起点
-END_COLOR = (0, 255, 0)            # 绿色 = 字符终点
+START_COLOR = START_COLOR_RGB      # 红色 = 字符起点
+END_COLOR = END_COLOR_RGB          # 绿色 = 字符终点
+SHARED_COLOR = SHARED_COLOR_RGB    # 紫色 = 共享边界
 PROB_HEIGHT = 51                   # 概率图高度（像素）
 PROB_MAX_PIXEL = 50                # 概率条最大高度
 
@@ -105,7 +112,7 @@ def load_lineage_intervals(lineage_path: Path, line_id: str) -> List[Tuple[int, 
     return intervals
 
 
-def compute_prob_map(pred_prob: np.ndarray, orig_width: int, scale: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def compute_prob_map(pred_prob: np.ndarray, orig_width: int, scale: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     将模型概率映射回原始图像宽度（用于可视化，无阈值截断）
 
@@ -115,34 +122,34 @@ def compute_prob_map(pred_prob: np.ndarray, orig_width: int, scale: float) -> Tu
         scale: 缩放比例
 
     Returns:
-        (prob_map, boundary_prob_map, bar_heights) 
-            字符概率图、边界概率图、条高度
+        (max_prob_map, class_map, bar_heights, blank_prob_map) 
+            最大概率图、类别图、条高度、空白概率图
+            class_map: 0=空白, 1=边界, 2=内部
     """
     inv_scale = 1.0 / scale if scale > 0 else 1.0
     n_channels, resized_w = pred_prob.shape
 
-    prob_map = np.zeros(orig_width, dtype=np.float32)
-    boundary_prob_map = np.zeros(orig_width, dtype=np.float32)
+    max_prob_map = np.zeros(orig_width, dtype=np.float32)
+    class_map = np.zeros(orig_width, dtype=np.int32)
     count_map = np.zeros(orig_width, dtype=np.int32)
 
     for resized_col in range(resized_w):
-        char_prob = max(pred_prob[1, resized_col], pred_prob[2, resized_col])
-        boundary_prob = pred_prob[1, resized_col]
+        max_prob = np.max(pred_prob[:, resized_col])
+        max_class = np.argmax(pred_prob[:, resized_col])
         
         orig_col = int(round(resized_col * inv_scale))
         orig_col = min(max(orig_col, 0), orig_width - 1)
         
-        prob_map[orig_col] += char_prob
-        boundary_prob_map[orig_col] += boundary_prob
+        max_prob_map[orig_col] += max_prob
+        class_map[orig_col] = max_class
         count_map[orig_col] += 1
 
     mask = count_map > 0
-    prob_map[mask] /= count_map[mask]
-    boundary_prob_map[mask] /= count_map[mask]
+    max_prob_map[mask] /= count_map[mask]
 
-    bar_heights = np.maximum(1, np.round(prob_map * PROB_MAX_PIXEL)).astype(np.int32)
+    bar_heights = np.maximum(1, np.round(max_prob_map * PROB_MAX_PIXEL)).astype(np.int32)
 
-    return prob_map, boundary_prob_map, bar_heights
+    return max_prob_map, class_map, bar_heights
 
 
 def draw_comparison(
@@ -204,9 +211,14 @@ def draw_comparison(
     # =====================================
     rule_img = base_img.copy()
     d_rule = ImageDraw.Draw(rule_img)
-    for s, e in rule_intervals:
+    
+    rule_starts, rule_ends, rule_shared = intervals_to_positions(rule_intervals)
+    for s in rule_starts:
         d_rule.line([(s, 0), (s, H)], fill=START_COLOR, width=CUT_LINE_WIDTH)
+    for e in rule_ends:
         d_rule.line([(e, 0), (e, H)], fill=END_COLOR, width=CUT_LINE_WIDTH)
+    for s in rule_shared:
+        d_rule.line([(s, 0), (s, H)], fill=SHARED_COLOR, width=CUT_LINE_WIDTH)
     canvas.paste(rule_img, (0, current_y))
     current_y += H
 
@@ -220,9 +232,14 @@ def draw_comparison(
         # =====================================
         rule_merge_img = base_img.copy()
         d_rule_merge = ImageDraw.Draw(rule_merge_img)
-        for s, e in rule_intervals_merged:
+        
+        rm_starts, rm_ends, rm_shared = intervals_to_positions(rule_intervals_merged)
+        for s in rm_starts:
             d_rule_merge.line([(s, 0), (s, H)], fill=START_COLOR, width=CUT_LINE_WIDTH)
+        for e in rm_ends:
             d_rule_merge.line([(e, 0), (e, H)], fill=END_COLOR, width=CUT_LINE_WIDTH)
+        for s in rm_shared:
+            d_rule_merge.line([(s, 0), (s, H)], fill=SHARED_COLOR, width=CUT_LINE_WIDTH)
         canvas.paste(rule_merge_img, (0, current_y))
         current_y += H
 
@@ -235,9 +252,14 @@ def draw_comparison(
     # =====================================
     model_img = base_img.copy()
     d_model = ImageDraw.Draw(model_img)
-    for s, e in model_intervals:
+    
+    model_starts, model_ends, model_shared = intervals_to_positions(model_intervals)
+    for s in model_starts:
         d_model.line([(s, 0), (s, H)], fill=START_COLOR, width=CUT_LINE_WIDTH)
+    for e in model_ends:
         d_model.line([(e, 0), (e, H)], fill=END_COLOR, width=CUT_LINE_WIDTH)
+    for s in model_shared:
+        d_model.line([(s, 0), (s, H)], fill=SHARED_COLOR, width=CUT_LINE_WIDTH)
     canvas.paste(model_img, (0, current_y))
     current_y += H
 
@@ -246,19 +268,29 @@ def draw_comparison(
 
     # =====================================
     # 最后行：概率热力图（使用softmax后的真实概率值，无阈值截断）
+    # 颜色映射：内部=红色, 边界=黄色, 空白=蓝色, 高度=概率大小
     # =====================================
-    prob_map, boundary_prob_map, bar_heights = compute_prob_map(pred_prob, W, scale)
+    max_prob_map, class_map, bar_heights = compute_prob_map(pred_prob, W, scale)
 
     for col in range(W):
-        prob = prob_map[col]
-        boundary_prob = boundary_prob_map[col]
-        bar_height = max(1, int(round(prob * PROB_MAX_PIXEL)))
+        max_prob = max_prob_map[col]
+        pred_class = class_map[col]
+        bar_height = bar_heights[col]
         y_start = total_height - bar_height
         y_end = total_height
         
-        r = int(255 * prob)
-        g = int(255 * boundary_prob)
-        b = int(255 * (1 - prob))
+        if pred_class == 2:
+            r = int(255 * max_prob)
+            g = 0
+            b = 0
+        elif pred_class == 1:
+            r = int(255 * max_prob)
+            g = int(255 * max_prob)
+            b = 0
+        else:
+            r = 0
+            g = 0
+            b = int(255 * max_prob)
         
         draw.line([(col, y_start), (col, y_end)], fill=(r, g, b), width=1)
 
