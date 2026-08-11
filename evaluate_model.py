@@ -95,6 +95,107 @@ def iou(a: Tuple[int, int], b: Tuple[int, int]) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def merge_fragments(
+    pred_chars: List[Tuple[int, int]],
+    width_ratio: float = 0.5,
+    strategy: str = 'nearest',
+    max_gap: Optional[int] = None,
+) -> List[Tuple[int, int]]:
+    """
+    推理后处理：合并窄碎片到相邻字符。
+
+    针对模型过分割产生的碎片（sliver），这些碎片宽度远小于该行字符中位宽度，
+    且通常紧邻真实字符。本函数将这些窄碎片合并进左/右相邻字符。
+
+    Args:
+        pred_chars: 模型预测字符区间列表 [(start_col, end_col), ...]
+        width_ratio: 窄碎片判定阈值：宽度 < 中位宽 × ratio 视为碎片（默认 0.5）
+        strategy: 合并策略
+            - 'nearest': 合并到间隙更小的邻居（默认）
+            - 'larger' : 合并到宽度更大的邻居
+            - 'left'   : 总是合并到左侧
+            - 'right'  : 总是合并到右侧
+        max_gap: 合并的最大允许间隙（像素），None 表示不限制。
+                 防止把真正独立的窄字符（如 丨、一）误并进相邻字符。
+
+    Returns:
+        合并后的字符区间列表（按 start 排序）
+    """
+    if len(pred_chars) < 2:
+        return list(pred_chars)
+
+    widths = [e - s for s, e in pred_chars]
+    median_width = float(np.median(widths))
+    if median_width <= 0:
+        return list(pred_chars)
+
+    chars = sorted(pred_chars, key=lambda x: x[0])
+
+    # 迭代合并：合并后新字符可能仍然很窄（若其自身是窄碎片+更小碎片的组合），需重复处理
+    changed = True
+    while changed:
+        changed = False
+        result = []
+        i = 0
+        n = len(chars)
+        while i < n:
+            s, e = chars[i]
+            w = e - s
+            if w < median_width * width_ratio:
+                left = result[-1] if result else None
+                right = chars[i + 1] if i + 1 < n else None
+
+                # 确定合并目标
+                target = None
+                if left and right:
+                    gap_left = s - left[1]
+                    gap_right = right[0] - e
+                    if strategy == 'left':
+                        target = 'left'
+                    elif strategy == 'right':
+                        target = 'right'
+                    elif strategy == 'larger':
+                        left_w = left[1] - left[0]
+                        right_w = right[1] - right[0]
+                        target = 'left' if left_w >= right_w else 'right'
+                    else:  # 'nearest'
+                        target = 'left' if gap_left <= gap_right else 'right'
+                elif left:
+                    target = 'left'
+                elif right:
+                    target = 'right'
+
+                if target is None:
+                    result.append(chars[i])
+                    i += 1
+                    continue
+
+                # max_gap 约束检查
+                if max_gap is not None:
+                    chosen_gap = (s - left[1]) if target == 'left' else (right[0] - e)
+                    if chosen_gap > max_gap:
+                        result.append(chars[i])
+                        i += 1
+                        continue
+
+                # 执行合并
+                if target == 'left':
+                    result[-1] = (min(left[0], s), max(left[1], e))
+                    changed = True
+                    i += 1
+                else:  # target == 'right'
+                    result.append((min(s, right[0]), max(e, right[1])))
+                    changed = True
+                    i += 2  # 跳过碎片和右侧字符
+                continue
+
+            result.append(chars[i])
+            i += 1
+        chars = result
+
+    return chars
+
+
 def greedy_match(pred_chars: List[Tuple[int, int]], gt_chars: List[Tuple[int, int]], iou_threshold: float = 0.3) -> Tuple[Dict[int, int], Dict[int, int], List[int], List[int]]:
     """贪心一对一匹配（带排序剪枝优化）"""
     pred_to_gt = {}
@@ -562,6 +663,8 @@ def aggregate_results(results: List[Dict]) -> Dict:
         'char_count_match_rate': sum(1 for m in metrics_list if m['char_count_match']) / n,
         'avg_pred_count': float(np.mean([r['pred_char_count'] for r in results])),
         'avg_gt_count': float(np.mean([r['gt_char_count'] for r in results])),
+        'total_pred_count': sum(r['pred_char_count'] for r in results),
+        'total_gt_count': sum(r['gt_char_count'] for r in results),
 
         # GT状态聚合
         'total_correct_gt': sum(m['correct_gt'] for m in metrics_list),

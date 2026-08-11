@@ -1,7 +1,7 @@
 import random
 import json
 from pathlib import Path
-from typing import List, Set, Optional, Dict
+from typing import List, Set, Optional
 from .annotation_registry import annotation_registry
 
 

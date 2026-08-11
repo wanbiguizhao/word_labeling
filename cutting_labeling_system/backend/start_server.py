@@ -1,6 +1,5 @@
 """启动汉字切割标注系统服务器"""
 import sys
-import os
 from pathlib import Path
 
 current_dir = Path(__file__).resolve().parent
