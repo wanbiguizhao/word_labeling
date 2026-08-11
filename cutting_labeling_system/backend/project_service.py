@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional
-from selector_service import selector_service
+from .selector_service import selector_service
 
 
 class ProjectService:

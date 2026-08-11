@@ -1,4 +1,12 @@
 """启动汉字切割标注系统服务器"""
+import sys
+import os
+from pathlib import Path
+
+current_dir = Path(__file__).resolve().parent
+project_root = current_dir.parent.parent
+sys.path.insert(0, str(project_root))
+
 import uvicorn
 
 if __name__ == "__main__":

@@ -16,10 +16,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from config import project_manager, MERGED_ANNOTATIONS_PATH
-from annotation_registry import annotation_registry
-from project_service import project_service
-from selector_service import selector_service
+from .config import project_manager, MERGED_ANNOTATIONS_PATH
+from .annotation_registry import annotation_registry
+from .project_service import project_service
+from .selector_service import selector_service
 
 from ai_model.common.cut_line_converter import (
     chars_to_lines as chars_to_lines_impl,
