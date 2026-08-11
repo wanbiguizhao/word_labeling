@@ -259,12 +259,14 @@ class SequenceDecoder:
         过滤宽度过小的区间
         
         模型可能预测出宽度为0或1的噪声区间，这些区间应该被过滤掉。
-        如果提供了全局字符宽度，则使用动态阈值（全局字符宽度的20%）。
+
+        特殊处理：目录页面中的省略号（宽度2-15px的小宽度字符）是合法的，
+        应该被保留。只有宽度为0或1的真正噪声才应该被过滤。
         
         Args:
             intervals: 区间列表
-            min_width: 最小宽度阈值（当global_char_width为0时使用）
-            global_char_width: 全局字符宽度，用于计算动态阈值
+            min_width: 最小宽度阈值
+            global_char_width: 全局字符宽度（已废弃，保留兼容性）
         
         Returns:
             filtered_intervals: 过滤后的区间列表
@@ -272,17 +274,88 @@ class SequenceDecoder:
         if len(intervals) == 0:
             return []
         
-        effective_min_width = min_width
-        if global_char_width > 0:
-            effective_min_width = max(min_width, int(global_char_width * 0.2))
-        
         filtered = []
         for start, end in intervals:
             width = end - start
-            if width >= effective_min_width:
+            if width >= 2:
                 filtered.append((start, end))
         
         return filtered
+    
+    @staticmethod
+    def _find_ellipsis_groups(small_intervals: List[Tuple[int, int, int]]) -> List[List[Tuple[int, int, int]]]:
+        """
+        识别省略号组（连续多个小宽度字符，宽度一致，间距规律）
+        
+        省略号特征：
+            1. 连续出现多个（>=3个）
+            2. 宽度基本一致（最大-最小 <= 2px）
+            3. 间距规律（相邻省略号之间的间距 <= 18px）
+        
+        处理逻辑：
+            1. 先按间距<=15px分组
+            2. 然后合并相邻的小组（间距<=18px且宽度一致）
+            3. 最后过滤掉不足3个的组
+        
+        Args:
+            small_intervals: 小宽度区间列表，每个元素 (start, end, width)
+        
+        Returns:
+            ellipsis_groups: 省略号组列表
+        """
+        if len(small_intervals) < 3:
+            return []
+        
+        small_intervals.sort(key=lambda x: x[0])
+        
+        groups = []
+        current_group = [small_intervals[0]]
+        
+        for interval in small_intervals[1:]:
+            last = current_group[-1]
+            gap = interval[0] - last[1]
+            
+            widths = [w for _, _, w in current_group]
+            widths.append(interval[2])
+            max_w = max(widths)
+            min_w = min(widths)
+            
+            if gap <= 15 and (max_w - min_w) <= 2:
+                current_group.append(interval)
+            else:
+                if len(current_group) >= 1:
+                    groups.append(current_group)
+                current_group = [interval]
+        
+        if len(current_group) >= 1:
+            groups.append(current_group)
+        
+        merged_groups = []
+        if len(groups) > 0:
+            merged_groups.append(groups[0])
+            
+            for group in groups[1:]:
+                last_group = merged_groups[-1]
+                if len(last_group) == 0 or len(group) == 0:
+                    merged_groups.append(group)
+                    continue
+                
+                gap = group[0][0] - last_group[-1][1]
+                
+                last_widths = [w for _, _, w in last_group]
+                group_widths = [w for _, _, w in group]
+                all_widths = last_widths + group_widths
+                max_w = max(all_widths)
+                min_w = min(all_widths)
+                
+                if gap <= 18 and (max_w - min_w) <= 2:
+                    last_group.extend(group)
+                else:
+                    merged_groups.append(group)
+        
+        final_groups = [g for g in merged_groups if len(g) >= 3]
+        
+        return final_groups
     
     @staticmethod
     def _decode_from_internal(pred_class: np.ndarray) -> List[Tuple[int, int]]:

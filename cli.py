@@ -556,6 +556,232 @@ def project_infer(project_id, model_path, data_base_path, batch_size, threshold)
     click.echo(f"[INFO] 输出目录: {model_jsons_dir}")
 
 
+@project.command("infer-all")
+@click.option("--model-path", type=click.Path(exists=True), default=None,
+              help="模型权重路径（默认: models/char_segment_1d_unet_best.pth）")
+@click.option("--data-base-path", type=click.Path(exists=True), default=None,
+              help="数据基础目录（默认: <项目根>/datahome）")
+@click.option("--output-version", type=str, default=None,
+              help="输出版本目录名（默认: 自动生成 v{timestamp}）")
+@click.option("--threshold", type=float, default=0.5, show_default=True,
+              help="模型预测概率阈值")
+@click.option("--save-detail/--no-save-detail", default=False, show_default=True,
+              help="是否保存详细结果（完整JSON，包含所有字段）")
+@click.option("--report-interval", type=int, default=500, show_default=True,
+              help="进度报告间隔")
+@click.option("--overwrite/--no-overwrite", default=False, show_default=True,
+              help="是否覆盖已有结果（否则跳过已完成的line_id）")
+@click.option("--limit", type=int, default=None,
+              help="限制处理数量（用于测试，默认处理全部）")
+def project_infer_all(model_path, data_base_path, output_version, threshold, 
+                      save_detail, report_interval, overwrite, limit):
+    """全量推理：对所有规则分割数据进行模型推理，使用分层存储
+    
+    存储结构：
+        datahome/model_inference/{version}/
+            metadata.json      - 推理元数据
+            inference.jsonl    - 轻量结果（字符区间）
+            detail/            - 详细结果（按PDF分区）
+    
+    轻量JSONL格式：
+        {"line_id":"xxx","char_count":N,"chars":[[start,end],...]}
+    
+    详细结果格式与 project infer 命令相同。
+    
+    支持断点续传：如果jsonl文件已存在且不启用overwrite，会跳过已完成的line_id。
+    """
+    import json
+    import cv2
+    import numpy as np
+    from datetime import datetime
+    from ai_model.inference.infer import CharSegmentPredictor
+    from ai_model.inference.inference_storage import (
+        write_inference_jsonl, write_detail_json, write_metadata,
+        read_inference_jsonl, extract_pdf_id
+    )
+    
+    data_path = Path(data_base_path) if data_base_path else BASE_DIR / "datahome"
+    model_dir = BASE_DIR / "ai_model" / "models"
+    
+    if model_path:
+        model_file = Path(model_path)
+    else:
+        model_file = model_dir / "char_segment_1d_unet_best.pth"
+    
+    if not model_file.exists():
+        click.echo(f"[ERROR] 模型文件不存在: {model_file}", err=True)
+        sys.exit(1)
+    
+    if output_version is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_version = f"v{timestamp}"
+    
+    inference_base = data_path / "model_inference" / output_version
+    jsonl_path = inference_base / "inference.jsonl"
+    detail_dir = inference_base / "detail"
+    metadata_path = inference_base / "metadata.json"
+    
+    inference_base.mkdir(parents=True, exist_ok=True)
+    
+    existing_line_ids = set()
+    if jsonl_path.exists() and not overwrite:
+        existing_results = read_inference_jsonl(jsonl_path)
+        existing_line_ids = set(existing_results.keys())
+        click.echo(f"[INFO] 检测到已有结果，将跳过 {len(existing_line_ids)} 个已完成的line_id")
+    
+    click.echo(f"[INFO] 推理版本: {output_version}")
+    click.echo(f"[INFO] 输出目录: {inference_base}")
+    click.echo(f"[INFO] 轻量结果: {jsonl_path}")
+    if save_detail:
+        click.echo(f"[INFO] 详细结果: {detail_dir}")
+    
+    rule_jsons_dir = data_path / "rule_jsons"
+    if not rule_jsons_dir.exists():
+        click.echo(f"[ERROR] 规则分割目录不存在: {rule_jsons_dir}", err=True)
+        sys.exit(1)
+    
+    rule_files = list(rule_jsons_dir.glob('*_rule.json'))
+    if len(rule_files) == 0:
+        click.echo(f"[ERROR] 规则分割目录为空", err=True)
+        sys.exit(1)
+    
+    line_ids = []
+    for f in rule_files:
+        stem = f.stem.replace('_rule', '')
+        if 'line_page_' in stem and '_pdf_' not in stem:
+            stem = stem.replace('line_page_', 'line_page_pdf_')
+        line_ids.append(stem)
+    if limit is not None:
+        line_ids = line_ids[:limit]
+        click.echo(f"[INFO] 测试模式：限制处理 {limit} 条数据")
+    
+    click.echo(f"[INFO] 总数据量: {len(line_ids)}")
+    
+    global_char_width = 0.0
+    all_widths = []
+    for f in rule_files[:100]:
+        try:
+            with open(f, 'r', encoding='utf-8') as fp:
+                data = json.load(fp)
+                if 'chars' in data:
+                    for char in data['chars']:
+                        w = char.get('width', 0)
+                        if w >= 3 and w <= 100:
+                            all_widths.append(w)
+        except Exception:
+            pass
+    
+    if len(all_widths) > 0:
+        global_char_width = float(np.median(all_widths))
+        click.echo(f"[INFO] 从规则切割数据计算全局中位字符宽度: {global_char_width:.2f} px")
+    
+    click.echo(f"[INFO] 加载模型: {model_file}")
+    predictor = CharSegmentPredictor(model_file, global_char_width=global_char_width)
+    
+    success_count = len(existing_line_ids)
+    fail_count = 0
+    
+    jsonl_buffer = []
+    detail_buffer = []
+    
+    click.echo(f"[INFO] 开始推理...")
+    
+    for i, line_id in enumerate(line_ids):
+        if line_id in existing_line_ids:
+            continue
+        
+        line_img_path = data_path / "lines" / f"{line_id}.png"
+        
+        if not line_img_path.exists():
+            click.echo(f"[WARN] 图像不存在: {line_img_path}")
+            fail_count += 1
+            continue
+        
+        img = cv2.imread(str(line_img_path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            click.echo(f"[WARN] 无法读取图像: {line_img_path}")
+            fail_count += 1
+            continue
+        
+        result = predictor.predict(img)
+        if result is None:
+            fail_count += 1
+            continue
+        
+        intervals, pred_prob, pred_logits, scale = result
+        
+        jsonl_buffer.append({
+            "line_id": line_id,
+            "char_count": len(intervals),
+            "chars": [[int(start), int(end)] for start, end in intervals]
+        })
+        
+        if save_detail:
+            chars = []
+            for idx, (start, end) in enumerate(intervals):
+                chars.append({
+                    "char_id": f"{line_id}_char_{idx}",
+                    "line_id": line_id,
+                    "char_idx": idx,
+                    "col_start": start,
+                    "col_end": end,
+                    "width": end - start
+                })
+            
+            output_data = {
+                "line_id": line_id,
+                "chars": chars,
+                "char_count": len(chars),
+                "width": img.shape[1],
+                "height": img.shape[0],
+                "threshold": threshold,
+                "model_path": str(model_file.name)
+            }
+            detail_buffer.append((line_id, output_data))
+        
+        success_count += 1
+        
+        if (i + 1) % report_interval == 0:
+            with open(jsonl_path, 'a', encoding='utf-8') as f:
+                for record in jsonl_buffer:
+                    f.write(json.dumps(record, ensure_ascii=False) + '\n')
+            jsonl_buffer = []
+            
+            if save_detail:
+                for line_id_detail, output_data_detail in detail_buffer:
+                    write_detail_json(detail_dir, line_id_detail, output_data_detail)
+                detail_buffer = []
+            
+            click.echo(f"[INFO] 已处理 {i + 1}/{len(line_ids)} ({success_count}成功, {fail_count}失败)")
+    
+    if jsonl_buffer:
+        with open(jsonl_path, 'a', encoding='utf-8') as f:
+            for record in jsonl_buffer:
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+    
+    if save_detail and detail_buffer:
+        for line_id_detail, output_data_detail in detail_buffer:
+            write_detail_json(detail_dir, line_id_detail, output_data_detail)
+    
+    params = {
+        "threshold": threshold,
+        "global_char_width": global_char_width,
+        "save_detail": save_detail,
+        "overwrite": overwrite,
+        "limit": limit
+    }
+    write_metadata(metadata_path, str(model_file.name), success_count, fail_count, params)
+    
+    click.echo(f"\n[INFO] 推理完成!")
+    click.echo(f"[INFO] 版本: {output_version}")
+    click.echo(f"[INFO] 成功: {success_count}")
+    click.echo(f"[INFO] 失败: {fail_count}")
+    click.echo(f"[INFO] 元数据: {metadata_path}")
+    click.echo(f"[INFO] 轻量结果: {jsonl_path}")
+    if save_detail:
+        click.echo(f"[INFO] 详细结果: {detail_dir}")
+
+
 @project.command("cache-lineage")
 @click.argument("project_id", type=str)
 @click.option("--data-base-path", type=click.Path(exists=True), default=None,

@@ -70,3 +70,5 @@ ai_model/data/dataset_split_merged.json
 ai_model/models/merged_annotation_al_ranking.json
 cutting_labeling_system/frontend/node_modules/*
 README.md
+eval*.json
+ai_model/models/inference_al_ranking.json
