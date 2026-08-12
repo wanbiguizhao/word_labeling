@@ -65,6 +65,31 @@ def segment_batch(start, end, parallel, max_workers, pattern, data_base_path):
     )
 
 
+@segment.command("reprocess")
+@click.option("--config", type=str, default=None,
+              help="后处理链配置名（如 merge_fragments_gap3），留空使用默认配置")
+@click.option("--data-base-path", type=click.Path(exists=True), default=None,
+              help="数据基础目录（默认: <项目根>/datahome）")
+def segment_reprocess(config, data_base_path):
+    """对已有 rule_jsons 重新应用后处理链（不重新切割图像）"""
+    from image_tools.segment_manager import SegmentManager
+    from image_tools.pdf_config import Pdf2ImageConfig
+    from image_tools.image_config import Image2LineConfig
+    from image_tools.segment_config import Line2CharConfig
+
+    data_path = Path(data_base_path) if data_base_path else BASE_DIR / "datahome"
+    char_cfg = Line2CharConfig()
+    mgr = SegmentManager(
+        pdf_cfg=Pdf2ImageConfig(),
+        img_cfg=Image2LineConfig(),
+        char_cfg=char_cfg,
+        data_base_path=data_path
+    )
+    stats = mgr.reprocess_rule_jsons(config_name=config)
+    click.echo(f"\n处理: {stats['processed']}/{stats['total']}, "
+               f"变更: {stats['changed']}, 失败: {stats['failed']}")
+
+
 # ============================================================
 # 命令组：train - 模型训练相关
 # ============================================================
