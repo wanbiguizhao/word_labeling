@@ -1,0 +1,15 @@
+{
+    "version": "merge_fragments_gap3",
+    "description": "合并窄碎片到相邻字符（width_ratio=0.5, max_gap=3, strategy=nearest）",
+    "steps": [
+        {
+            "name": "merge_fragments",
+            "enabled": true,
+            "params": {
+                "width_ratio": 0.5,
+                "max_gap": 3,
+                "strategy": "nearest"
+            }
+        }
+    ]
+}

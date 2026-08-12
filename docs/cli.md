@@ -25,7 +25,8 @@ python cli.py predict --help
 cli.py
 ├── segment          # PDF 文本分割流程
 │   ├── single       # 处理单个 PDF 文件
-│   └── batch        # 批量处理 PDF 文件
+│   ├── batch        # 批量处理 PDF 文件
+│   └── reprocess    # 对已有 rule_jsons 重新应用后处理链
 ├── train            # 训练深度学习分割模型
 │   ├── pretrain             # 预训练分割模型（使用 rule_jsons 数据）
 │   ├── finetune             # 微调分割模型（使用合并标注数据）
@@ -95,6 +96,77 @@ python cli.py segment batch --start 0 --end 10 --parallel --max-workers 4
 
 # 指定数据目录
 python cli.py segment batch --data-base-path /path/to/datahome
+```
+
+---
+
+### segment reprocess — 重新应用后处理链
+
+对已有的 `rule_jsons` 重新应用后处理链配置，**不重新读取图像、不重新切割**。从 `segments_type_start_end`（切割原始结果）重建 chars，确保可以反复切换配置不会累积后处理效果。
+
+```bash
+python cli.py segment reprocess [options]
+```
+
+**参数：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--config` | str | None | 后处理链配置名（如 `merge_fragments_gap3`），留空使用 segment_config 默认配置 |
+| `--data-base-path` | path | ./datahome | 数据基础目录 |
+
+**示例：**
+
+```bash
+# 用 merge_fragments_gap3 配置重新处理所有 rule_json
+python cli.py segment reprocess --config merge_fragments_gap3
+
+# 回退到基线（无后处理）
+python cli.py segment reprocess --config baseline
+
+# 用其他配置实验
+python cli.py segment reprocess --config merge_fragments_gap5
+```
+
+**工作流程：**
+
+1. 扫描 `rule_jsons/` 目录下所有 `*_rule.json` 文件
+2. 从 `segments_type_start_end` 重建原始切割 chars
+3. 按配置顺序执行后处理链（合并碎片、过滤脏点等）
+4. 更新 `chars`、`total_chars`、`postprocess_version` 字段并写回
+
+**输出示例：**
+
+```
+[POSTCHAIN] 使用配置: merge_fragments_gap3 (版本: merge_fragments_gap3)
+
+[Reprocess] 共 37649 个 rule_json，配置: merge_fragments_gap3
+  输入目录: D:\projects\work_projects\data_service\datahome\rule_jsons
+  进度: 500/37649
+  ...
+
+[Reprocess] 完成: 处理 37649/37649, 变更 27389, 失败 0
+
+处理: 37649/37649, 变更: 27389, 失败: 0
+```
+
+**后处理链配置文件：**
+
+配置文件位于 `image_tools/postprocess_configs/` 目录下：
+
+| 配置文件 | 说明 |
+|----------|------|
+| `baseline.json` | 无后处理（基线） |
+| `merge_fragments_gap3.json` | 合并窄碎片（width_ratio=0.5, max_gap=3） |
+| `merge_fragments_gap5.json` | 合并窄碎片（width_ratio=0.5, max_gap=5） |
+
+**评估对比：**
+
+切换配置后，可用评估脚本对比效果：
+
+```bash
+# 对比 merge_fragments_gap3 配置在标注数据集上的效果
+python evaluate_rule_merge.py --config merge_fragments_gap3
 ```
 
 ---
