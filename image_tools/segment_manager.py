@@ -90,6 +90,7 @@ import sys
 import json
 import shutil
 import time
+import gc
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -205,16 +206,13 @@ class SegmentManager:
             return get_default_pp_config()
     
     def _load_or_init_lineage(self) -> Dict:
-        """加载或初始化血缘索引"""
-        lineage_path = self.data_base_path / "lineage.json"
+        """
+        初始化空的血缘索引（不全量加载 lineage.json）
         
-        if lineage_path.exists():
-            try:
-                with open(lineage_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                pass
-        
+        lineage.json 可能有 1+ GB 的历史数据，全量加载会占用 2+ GB 内存。
+        处理过程中所有读写都是当前 PDF 的增量数据，不需要历史数据。
+        保存时通过 _save_lineage 增量合并到磁盘文件。
+        """
         return {
             "metadata": {
                 "version": "1.0",
@@ -232,19 +230,60 @@ class SegmentManager:
         }
     
     def _save_lineage(self, force: bool = False) -> None:
-        """保存血缘索引到文件（支持延迟写入）"""
+        """
+        增量合并保存血缘索引到文件
+        
+        分两步避免内存峰值：
+        1. 读取旧 lineage.json → update 增量 → 写回（单次 I/O）
+        2. 旧数据在 update 后立即释放
+        
+        如果 lineage.json 不存在或为空，直接写入当前增量。
+        """
         if not force and not self._save_pending:
             return
-        
+
         lineage_path = self.data_base_path / "lineage.json"
+        
+        # 读取磁盘上的旧数据
+        existing = {}
+        if lineage_path.exists():
+            try:
+                with open(lineage_path, 'r', encoding='utf-8') as f:
+                    existing = json.load(f)
+            except Exception:
+                existing = {}
+        
+        # 合并增量数据
+        for key in ("pdfs", "pages", "lines", "chars"):
+            existing.setdefault(key, {}).update(self.lineage.get(key, {}))
+        existing["metadata"] = self.lineage["metadata"]
+        
+        # 写回磁盘
         with open(lineage_path, 'w', encoding='utf-8') as f:
-            json.dump(self.lineage, f, ensure_ascii=False, indent=2, default=str)
+            json.dump(existing, f, ensure_ascii=False, indent=2, default=str)
+        
+        # 释放旧数据
+        del existing
+        gc.collect()
         
         self._save_pending = False
     
     def _mark_dirty(self) -> None:
         """标记血缘索引需要保存"""
         self._save_pending = True
+    
+    def _reset_lineage_increment(self) -> None:
+        """
+        清空内存中的 lineage 增量数据（已通过 _save_lineage 增量合并到磁盘）
+        
+        用于串行批量处理：每个 PDF 处理完并保存后，清空内存中的增量，
+        避免多个 PDF 的 lineage 数据在内存中累积。
+        """
+        self.lineage["pdfs"].clear()
+        self.lineage["pages"].clear()
+        self.lineage["lines"].clear()
+        self.lineage["chars"].clear()
+        gc.collect()
     
     def _generate_id(self, prefix: str, *args) -> str:
         """生成唯一ID"""
@@ -261,6 +300,7 @@ class SegmentManager:
         Returns:
             (success, page_ids)
         """
+        doc = None
         try:
             pdf_filename = Path(pdf_path).name
             pdf_id = self._generate_id("pdf", Path(pdf_path).stem)
@@ -316,8 +356,9 @@ class SegmentManager:
                 }
                 pages_ref[page_id] = page_info
                 page_ids[idx] = page_id
-            
-            doc.close()
+                
+                # 释放 pix 对象（避免高分辨率页面图像累积）
+                del pix
             
             self.lineage["pdfs"][pdf_id] = {
                 "pdf_id": pdf_id,
@@ -331,6 +372,9 @@ class SegmentManager:
             
         except Exception as e:
             return False, [str(e)]
+        finally:
+            if doc is not None:
+                doc.close()
     
     @staticmethod
     def _fast_line_detection(image_path: str, cfg: CharSegmentConfig) -> Tuple[List[Tuple[int, int]], np.ndarray, int, int]:
@@ -897,6 +941,10 @@ class SegmentManager:
         timings["extract_chars"] = t2 - t1
         print(f"   提取 {total_chars} 个汉字 | 耗时: {timings['extract_chars']:.2f}s")
         
+        # 释放 rule_results（数据已写入磁盘和 lineage，不再需要）
+        del rule_results
+        gc.collect()
+        
         t1 = time.time()
         print(f"[5/5] 后处理：合并粘连字符...")
         self.postprocess_merge_chars()
@@ -1032,6 +1080,10 @@ class SegmentManager:
         t2 = time.time()
         timings["extract_chars"] = t2 - t1
         print(f"   提取 {total_chars} 个汉字 | 耗时: {timings['extract_chars']:.2f}s")
+        
+        # 释放 rule_results（数据已写入磁盘和 lineage，不再需要）
+        del rule_results
+        gc.collect()
         
         t1 = time.time()
         print(f"[5/5] 后处理：合并粘连字符...")
@@ -1405,6 +1457,15 @@ def run_segment_batch(
     if parallel and selected_count > 1:
         print(f"\n[BATCH] 启动PDF级别并行处理 ({max_workers} 进程)...")
         
+        # 增量合并：每完成一个PDF立即合并到segment_manager，不累积all_lineages列表
+        segment_manager = SegmentManager(
+            pdf_cfg=pdf_cfg,
+            img_cfg=img_cfg,
+            char_cfg=char_cfg,
+            data_base_path=data_base_path
+        )
+        completed_count = 0
+        
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             future_to_pdf = {
                 executor.submit(
@@ -1415,9 +1476,6 @@ def run_segment_batch(
                 ): pdf_path for pdf_path in selected_files
             }
             
-            all_lineages = []
-            completed_count = 0
-            
             if HAS_TQDM:
                 with tqdm(total=selected_count, desc="[BATCH] 并行处理进度", unit="pdf",
                           bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
@@ -1427,7 +1485,12 @@ def run_segment_batch(
                         
                         try:
                             lineage = future.result()
-                            all_lineages.append(lineage)
+                            # 立即合并到 segment_manager，然后 del 释放内存
+                            segment_manager.lineage["pdfs"].update(lineage.get("pdfs", {}))
+                            segment_manager.lineage["pages"].update(lineage.get("pages", {}))
+                            segment_manager.lineage["lines"].update(lineage.get("lines", {}))
+                            segment_manager.lineage["chars"].update(lineage.get("chars", {}))
+                            del lineage
                             pbar.set_postfix({"完成": pdf_path.name})
                         except Exception as e:
                             print(f"\n[ERROR] 处理失败: {pdf_path.name} - {str(e)}")
@@ -1440,27 +1503,18 @@ def run_segment_batch(
                     
                     try:
                         lineage = future.result()
-                        all_lineages.append(lineage)
+                        segment_manager.lineage["pdfs"].update(lineage.get("pdfs", {}))
+                        segment_manager.lineage["pages"].update(lineage.get("pages", {}))
+                        segment_manager.lineage["lines"].update(lineage.get("lines", {}))
+                        segment_manager.lineage["chars"].update(lineage.get("chars", {}))
+                        del lineage
                         elapsed = time.time() - start_time
                         progress = _format_progress_bar(completed_count, selected_count)
                         print(f"[BATCH] {progress} [{completed_count}/{selected_count}] 完成: {pdf_path.name} | 已用时: {_format_time(elapsed)}")
                     except Exception as e:
                         print(f"[ERROR] 处理失败: {pdf_path.name} - {str(e)}")
         
-        print(f"\n[BATCH] 合并 {len(all_lineages)} 个PDF的血缘索引...")
-        segment_manager = SegmentManager(
-            pdf_cfg=pdf_cfg,
-            img_cfg=img_cfg,
-            char_cfg=char_cfg,
-            data_base_path=data_base_path
-        )
-        
-        for lineage in all_lineages:
-            segment_manager.lineage["pdfs"].update(lineage.get("pdfs", {}))
-            segment_manager.lineage["pages"].update(lineage.get("pages", {}))
-            segment_manager.lineage["lines"].update(lineage.get("lines", {}))
-            segment_manager.lineage["chars"].update(lineage.get("chars", {}))
-        
+        print(f"\n[BATCH] 合并 {completed_count} 个PDF的血缘索引...")
         segment_manager.lineage["metadata"]["total_pdfs"] = len(segment_manager.lineage["pdfs"])
         segment_manager.lineage["metadata"]["total_pages"] = len(segment_manager.lineage["pages"])
         segment_manager.lineage["metadata"]["total_lines"] = len(segment_manager.lineage["lines"])
@@ -1484,7 +1538,7 @@ def run_segment_batch(
                     pbar.set_postfix({"文件": pdf_path.name})
                     
                     try:
-                        # 批量模式下不单独保存，最后统一写入
+                        # 不保存lineage（避免每个PDF都读写1.3GB文件），最后统一保存
                         segment_manager.process_pdf(str(pdf_path), save_lineage=False)
                     except Exception as e:
                         print(f"\n[ERROR] 处理失败: {pdf_path.name} - {str(e)}")
@@ -1509,12 +1563,13 @@ def run_segment_batch(
                 except Exception as e:
                     print(f"[ERROR] 处理失败: {pdf_path.name} - {str(e)}")
     
-    # 批量处理结束后统一保存血缘索引
+    # 串行模式：最后统一保存一次lineage（增量合并到磁盘）
     segment_manager.lineage["metadata"]["total_pdfs"] = len(segment_manager.lineage["pdfs"])
     segment_manager.lineage["metadata"]["total_pages"] = len(segment_manager.lineage["pages"])
     segment_manager.lineage["metadata"]["total_lines"] = len(segment_manager.lineage["lines"])
     segment_manager.lineage["metadata"]["total_chars"] = len(segment_manager.lineage["chars"])
     segment_manager._save_lineage(force=True)
+    print(f"[BATCH] 血缘索引已保存")
     
     total_time = time.time() - start_time
     print(f"\n{'='*60}")
