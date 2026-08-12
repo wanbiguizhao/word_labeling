@@ -5,6 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from pathlib import Path
 import json
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 try:
@@ -303,11 +304,24 @@ def save_model_and_history(
     final_path = model_dir / f"{model_name}_final.pth"
     torch.save(model.state_dict(), str(final_path))
     
+    # 判断训练类型（预训练 / 微调），通过模型名后缀识别
+    training_mode = "finetune" if "finetune" in model_name.lower() else "pretrain"
+    
+    # 在历史中附加训练元信息，方便后续对比和推理侧识别
+    history["_metadata"] = {
+        "model_name": model_name,
+        "training_mode": training_mode,  # pretrain / finetune
+        "final_model_path": str(final_path.name),
+        "best_model_path": f"{model_name}_best.pth",
+        "saved_at": datetime.now().isoformat()
+    }
+    
     history_path = model_dir / history_file
     with open(history_path, 'w', encoding='utf-8') as f:
         json.dump(history, f, indent=2)
     
     print(f"[INFO] 模型保存到: {model_dir}")
+    print(f"[INFO] 训练类型: {training_mode}  |  最终模型: {final_path.name}")
 
 
 def setup_scheduler(

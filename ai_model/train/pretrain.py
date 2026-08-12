@@ -167,13 +167,15 @@ if __name__ == "__main__":
     @click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader 并行数")
     @click.option("--use-amp/--no-amp", default=True, help="是否启用混合精度训练")
     @click.option("--checkpoint-dir", type=str, default="models", show_default=True, help="模型保存目录")
+    @click.option("--model-name", type=str, default=TrainConfig.model_name, show_default=True,
+                  help="模型名称前缀，产物会保存为 {model_name}_best.pth / {model_name}_final.pth")
     @click.option("--data-base-path", type=str, default="datahome", show_default=True,
                   help="数据基础目录（相对项目根）")
     @click.option("--split-file", type=str, default="ai_model/data/dataset_split.json",
                   show_default=True, help="数据集划分文件路径（相对项目根）")
     @click.option("--seed", type=int, default=42, show_default=True, help="随机种子")
     def cli(batch_size, learning_rate, num_epochs, train_ratio,
-            device, num_workers, use_amp, checkpoint_dir,
+            device, num_workers, use_amp, checkpoint_dir, model_name,
             data_base_path, split_file, seed):
         cfg = TrainConfig(
             batch_size=batch_size,
@@ -184,10 +186,13 @@ if __name__ == "__main__":
             num_workers=num_workers,
             use_amp=use_amp,
             checkpoint_dir=checkpoint_dir,
+            model_name=model_name,
             data_base_path=data_base_path,
             split_file=split_file,
             seed=seed
         )
+        print(f"[INFO] 输出模型名: {cfg.model_name} → "
+              f"{cfg.model_name}_best.pth / {cfg.model_name}_final.pth")
         main(cfg)
     
     cli()

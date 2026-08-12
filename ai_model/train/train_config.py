@@ -43,6 +43,9 @@ class TrainConfig:
 
 @dataclass
 class FineTuneConfig(TrainConfig):
+    # 微调模型默认使用带 _finetune 后缀的名称，避免与预训练产物混淆
+    model_name: str = "char_segment_1d_unet_finetune"
+    
     annotations_file: Optional[str] = None
     
     pretrained_model_path: Optional[str] = None

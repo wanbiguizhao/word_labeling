@@ -283,6 +283,8 @@ if __name__ == "__main__":
     @click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader 并行数")
     @click.option("--use-amp/--no-amp", default=True, help="是否启用混合精度训练")
     @click.option("--checkpoint-dir", type=str, default="models", show_default=True, help="模型保存目录")
+    @click.option("--model-name", type=str, default=FineTuneConfig.model_name, show_default=True,
+                  help="模型名称前缀，产物会保存为 {model_name}_best.pth / {model_name}_final.pth（默认已带 _finetune）")
     @click.option("--data-base-path", type=str, default="datahome", show_default=True,
                   help="数据基础目录（相对项目根）")
     @click.option("--dataset", "annotations_file", type=str, default=None,
@@ -299,7 +301,7 @@ if __name__ == "__main__":
     @click.option("--no-validation/--with-validation", default=False,
                   help="是否使用全部数据训练（无验证集）")
     def cli(batch_size, num_epochs, train_ratio,
-            device, num_workers, use_amp, checkpoint_dir,
+            device, num_workers, use_amp, checkpoint_dir, model_name,
             data_base_path, annotations_file, split_file, seed,
             pretrained_model_path, freeze_layers, fine_tune_lr, no_validation):
         cfg = FineTuneConfig(
@@ -310,6 +312,7 @@ if __name__ == "__main__":
             num_workers=num_workers,
             use_amp=use_amp,
             checkpoint_dir=checkpoint_dir,
+            model_name=model_name,
             data_base_path=data_base_path,
             annotations_file=annotations_file,
             split_file=split_file,
@@ -319,6 +322,8 @@ if __name__ == "__main__":
             fine_tune_lr=fine_tune_lr,
             no_validation=no_validation
         )
+        print(f"[INFO] 输出模型名: {cfg.model_name} → "
+              f"{cfg.model_name}_best.pth / {cfg.model_name}_final.pth")
         main(cfg)
     
     cli()
