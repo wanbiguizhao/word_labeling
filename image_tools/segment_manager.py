@@ -112,6 +112,12 @@ sys.path.append(str(BASE_DIR))
 from image_tools.pdf_config import Pdf2ImageConfig
 from image_tools.image_config import Image2LineConfig
 from image_tools.segment_config import Line2CharConfig
+from image_tools.postprocess_chain import (
+    resolve_config_path,
+    load_config as load_pp_config,
+    run_chain as run_pp_chain,
+    get_default_config as get_default_pp_config,
+)
 from image_tools.imageCore import (
     CharSegmentConfig, TextLineDetector, VerticalProjectionSegmenter
 )
@@ -174,8 +180,29 @@ class SegmentManager:
         
         char_cfg.init_directories(data_base_path)
         
+        # 加载后处理链配置
+        self._pp_config = self._load_postprocess_config()
+        
         self.lineage = self._load_or_init_lineage()
         self._save_pending = False
+    
+    def _load_postprocess_config(self) -> Dict:
+        """加载后处理链配置"""
+        config_name = self.char_cfg.postprocess_chain_config
+        if not config_name or config_name == "baseline":
+            return get_default_pp_config()
+        try:
+            config_path = resolve_config_path(config_name)
+            if config_path.exists():
+                cfg = load_pp_config(config_path)
+                print(f"  [POSTCHAIN] 加载后处理配置: {config_name} (版本: {cfg.get('version', '?')})")
+                return cfg
+            else:
+                print(f"  [POSTCHAIN] 配置文件不存在: {config_path}，使用基线")
+                return get_default_pp_config()
+        except Exception as e:
+            print(f"  [POSTCHAIN] 加载配置失败: {e}，使用基线")
+            return get_default_pp_config()
     
     def _load_or_init_lineage(self) -> Dict:
         """加载或初始化血缘索引"""
@@ -478,6 +505,10 @@ class SegmentManager:
                             "width": int(end - start)
                         })
                 
+                # 后处理链：按配置顺序执行（合并碎片、过滤脏点等）
+                pp_context = {"line_id": line_id, "image_width": w, "image_height": h}
+                chars = run_pp_chain(chars, self._pp_config, pp_context)
+                
                 rule_result = {
                     "line_id": line_id,
                     "image_path": str(line_path.relative_to(self.data_base_path)),
@@ -488,6 +519,7 @@ class SegmentManager:
                     "image_height": h,
                     "total_segments": len(segments),
                     "segmentation_version": seg_version,
+                    "postprocess_version": self._pp_config.get("version", "baseline"),
                     "created_at": created_at
                 }
                 
@@ -505,6 +537,110 @@ class SegmentManager:
         
         self._mark_dirty()
         return results
+    
+    def reprocess_rule_jsons(self, config_name: str = None, line_ids: List[str] = None) -> Dict:
+        """
+        对已有的 rule_json 重新应用后处理链（不重新读取图像、不重新切割）
+        
+        读取 rule_json → 提取 chars → 应用后处理链 → 写回 rule_json
+        
+        Args:
+            config_name: 后处理链配置名（如 "merge_fragments_gap3"）。
+                         None 表示使用 segment_config 中的默认配置。
+            line_ids: 指定处理的行ID列表。None 表示处理所有 rule_json。
+        
+        Returns:
+            统计信息 {"total": N, "processed": N, "changed": N, "failed": N}
+        """
+        rule_json_dir = self.data_base_path / self.char_cfg.rule_json_dir
+        if not rule_json_dir.exists():
+            print(f"[ERROR] rule_jsons 目录不存在: {rule_json_dir}")
+            return {"total": 0, "processed": 0, "changed": 0, "failed": 0}
+        
+        # 加载指定的后处理链配置
+        if config_name and config_name != "baseline":
+            config_path = resolve_config_path(config_name)
+            if config_path.exists():
+                pp_config = load_pp_config(config_path)
+                print(f"  [POSTCHAIN] 使用配置: {config_name} (版本: {pp_config.get('version', '?')})")
+            else:
+                print(f"  [POSTCHAIN] 配置文件不存在: {config_path}，使用默认配置")
+                pp_config = self._pp_config
+        else:
+            pp_config = self._pp_config
+        
+        pp_version = pp_config.get("version", "baseline")
+        
+        # 收集要处理的文件
+        if line_ids:
+            rule_files = [rule_json_dir / f"{lid}_rule.json" for lid in line_ids]
+            rule_files = [f for f in rule_files if f.exists()]
+        else:
+            rule_files = sorted(rule_json_dir.glob("*_rule.json"))
+        
+        total = len(rule_files)
+        processed = 0
+        changed = 0
+        failed = 0
+        
+        print(f"\n[Reprocess] 共 {total} 个 rule_json，配置: {pp_version}")
+        print(f"  输入目录: {rule_json_dir}")
+        
+        for i, rule_file in enumerate(rule_files):
+            if (i + 1) % 500 == 0:
+                print(f"  进度: {i + 1}/{total}")
+            
+            try:
+                with open(rule_file, 'r', encoding='utf-8') as f:
+                    rule_data = json.load(f)
+                
+                # 提取原始 chars（从 segments_type_start_end 重建，确保是切割原始结果）
+                # 如果有 segments_type_start_end，从它重建；否则用现有 chars
+                if "segments_type_start_end" in rule_data:
+                    original_chars = []
+                    for seg_type, start, end in rule_data["segments_type_start_end"]:
+                        if seg_type == 1:
+                            original_chars.append({
+                                "col_start": int(start),
+                                "col_end": int(end),
+                                "width": int(end - start)
+                            })
+                else:
+                    original_chars = [dict(c) for c in rule_data.get("chars", [])]
+                
+                # 应用后处理链
+                image_width = rule_data.get("image_width", 0)
+                image_height = rule_data.get("image_height", 0)
+                line_id = rule_data.get("line_id", rule_file.stem.replace("_rule", ""))
+                pp_context = {"line_id": line_id, "image_width": image_width, "image_height": image_height}
+                new_chars = run_pp_chain(original_chars, pp_config, pp_context, verbose=False)
+                
+                # 检查是否有变化
+                old_chars = rule_data.get("chars", [])
+                char_changed = len(old_chars) != len(new_chars) or \
+                    any(o["col_start"] != n["col_start"] or o["col_end"] != n["col_end"]
+                        for o, n in zip(old_chars, new_chars))
+                
+                if char_changed:
+                    changed += 1
+                
+                # 更新并写回
+                rule_data["chars"] = new_chars
+                rule_data["total_chars"] = len(new_chars)
+                rule_data["postprocess_version"] = pp_version
+                
+                with open(rule_file, 'w', encoding='utf-8') as f:
+                    json.dump(rule_data, f, ensure_ascii=False, separators=(',', ':'))
+                
+                processed += 1
+                
+            except Exception as e:
+                print(f"  [ERROR] 处理失败: {rule_file.name} - {e}")
+                failed += 1
+                continue
+        
+        print(f"\n[Reprocess] 完成: 处理 {processed}/{total}, 变更 {changed}, 失败 {failed}")
+        return {"total": total, "processed": processed, "changed": changed, "failed": failed}
     
     def extract_char_images(self, line_id: str, rule_data: Dict) -> List[str]:
         """
@@ -1049,6 +1185,10 @@ class SegmentManager:
                             "width": int(end - start)
                         })
                 
+                # 后处理链：按配置顺序执行
+                pp_context = {"line_id": line_id, "image_width": w, "image_height": h}
+                chars = run_pp_chain(chars, self._pp_config, pp_context)
+                
                 rule_result = {
                     "line_id": line_id,
                     "image_path": str(line_path.relative_to(self.data_base_path)),
@@ -1059,6 +1199,7 @@ class SegmentManager:
                     "image_height": h,
                     "total_segments": len(segments),
                     "segmentation_version": seg_version,
+                    "postprocess_version": self._pp_config.get("version", "baseline"),
                     "created_at": created_at
                 }
                 
