@@ -108,13 +108,15 @@ def train():
 @click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader 并行数")
 @click.option("--use-amp/--no-amp", default=True, help="是否启用混合精度训练")
 @click.option("--checkpoint-dir", type=str, default="models", show_default=True, help="模型保存目录")
+@click.option("--model-name", type=str, default=None,
+              help="模型名称前缀（默认: char_segment_1d_unet）。产物为 {name}_best.pth / {name}_final.pth")
 @click.option("--data-base-path", type=str, default="datahome", show_default=True,
               help="数据基础目录（相对项目根）")
 @click.option("--split-file", type=str, default="ai_model/data/dataset_split.json",
               show_default=True, help="数据集划分文件路径（相对项目根）")
 @click.option("--seed", type=int, default=42, show_default=True, help="随机种子")
 def train_pretrain(batch_size, learning_rate, num_epochs, train_ratio,
-                   device, num_workers, use_amp, checkpoint_dir,
+                   device, num_workers, use_amp, checkpoint_dir, model_name,
                    data_base_path, split_file, seed):
     """预训练分割模型（使用 rule_jsons 数据）"""
     from ai_model.train.train_config import TrainConfig
@@ -129,10 +131,13 @@ def train_pretrain(batch_size, learning_rate, num_epochs, train_ratio,
         num_workers=num_workers,
         use_amp=use_amp,
         checkpoint_dir=checkpoint_dir,
+        **({"model_name": model_name} if model_name else {}),
         data_base_path=data_base_path,
         split_file=split_file,
         seed=seed
     )
+    click.echo(f"[INFO] 输出模型名: {cfg.model_name} → "
+               f"{cfg.model_name}_best.pth / {cfg.model_name}_final.pth")
     pretrain_main(cfg)
 
 
@@ -145,6 +150,8 @@ def train_pretrain(batch_size, learning_rate, num_epochs, train_ratio,
 @click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader 并行数")
 @click.option("--use-amp/--no-amp", default=True, help="是否启用混合精度训练")
 @click.option("--checkpoint-dir", type=str, default="models", show_default=True, help="模型保存目录")
+@click.option("--model-name", type=str, default=None,
+              help="模型名称前缀（默认: char_segment_1d_unet_finetune）。产物为 {name}_best.pth / {name}_final.pth")
 @click.option("--data-base-path", type=str, default="datahome", show_default=True,
               help="数据基础目录（相对项目根）")
 @click.option("--dataset", type=str, default=None,
@@ -161,7 +168,7 @@ def train_pretrain(batch_size, learning_rate, num_epochs, train_ratio,
 @click.option("--no-validation/--with-validation", default=False,
               help="是否使用全部数据训练（无验证集）")
 def train_finetune(batch_size, num_epochs, train_ratio,
-                   device, num_workers, use_amp, checkpoint_dir,
+                   device, num_workers, use_amp, checkpoint_dir, model_name,
                    data_base_path, dataset, split_file, seed,
                    pretrained_model, freeze_layers, fine_tune_lr, no_validation):
     """微调分割模型（使用合并标注数据）"""
@@ -176,6 +183,7 @@ def train_finetune(batch_size, num_epochs, train_ratio,
         num_workers=num_workers,
         use_amp=use_amp,
         checkpoint_dir=checkpoint_dir,
+        **({"model_name": model_name} if model_name else {}),
         data_base_path=data_base_path,
         annotations_file=dataset,
         split_file=split_file,
@@ -185,6 +193,8 @@ def train_finetune(batch_size, num_epochs, train_ratio,
         fine_tune_lr=fine_tune_lr,
         no_validation=no_validation
     )
+    click.echo(f"[INFO] 输出模型名: {cfg.model_name} → "
+               f"{cfg.model_name}_best.pth / {cfg.model_name}_final.pth")
     finetune_main(cfg)
 
 

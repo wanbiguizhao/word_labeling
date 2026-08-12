@@ -89,6 +89,38 @@ def freeze_encoder(model: nn.Module):
             param.requires_grad = False
 
 
+def freeze_bn_running_stats(model: nn.Module, freeze_affine: bool = False):
+    """
+    冻结所有 BatchNorm1d 的 running_mean / running_var 更新，防止小样本统计量漂移。
+
+    背景：微调通常使用几十~几百条人工标注数据（远少于预训练数据量），
+    这些样本还可能因主动学习筛选而分布偏斜。BN momentum 每步会把 10%
+    的 batch 统计量融合进 running_stats，经过几十个 epoch 后 BN 统计量
+    几乎完全被小样本"污染"，推理(eval)模式使用漂移后的统计量会直接
+    导致整体分布上的性能退化。
+
+    实现方式：
+      1. 设置 momentum=0 → running_mean / running_var 不再随 batch 更新
+         （比设置 m.eval() 更鲁棒，因为 train_epoch 里会调用 model.train()
+         重新把 BN 切回 train 模式，导致 eval 方式冻结失效）
+      2. 可选冻结 affine 参数（weight/bias）
+    """
+    bn_count = 0
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm1d):
+            m.momentum = 0.0
+            bn_count += 1
+            if freeze_affine:
+                if m.weight is not None:
+                    m.weight.requires_grad = False
+                if m.bias is not None:
+                    m.bias.requires_grad = False
+    if bn_count > 0:
+        print(f"[INFO] 冻结 {bn_count} 个 BatchNorm1d 的 running stats"
+              f"（momentum=0，沿用预训练统计量，防止小样本漂移）"
+              f"{' affine也冻结' if freeze_affine else ''}")
+
+
 def main(config: FineTuneConfig = None):
     if config is None:
         config = FineTuneConfig()
@@ -209,6 +241,10 @@ def main(config: FineTuneConfig = None):
     
     if config.freeze_layers:
         freeze_encoder(model)
+
+    # 无论是否冻结编码器，微调时都应冻结 BN running stats
+    # （防止几百条小样本/偏斜样本把预训练统计量"冲掉"）
+    freeze_bn_running_stats(model, freeze_affine=False)
     
     criterion = FocalLoss(gamma=2.0)
     

@@ -434,13 +434,26 @@ class CharSegmentDataset(Dataset):
         if image_height <= 0:
             image_height = img.shape[0]
         image_height = int(image_height * scale)
+
+        # 判断是否需要启用 LabelGenerator 中的碎片合并：
+        #   - 微调模式（GT 人工标注传入 annotations）：绝对不合并，
+        #     因为人工标注的 chars 已经是人工确认的真值，再次合并会把
+        #     刻意分开的标点、省略号点等错误合并，导致标签污染。
+        #   - 预训练模式（rule_json）：如果 rule_json 已经经过 postprocess
+        #     后处理（postprocess_version != 'baseline'），说明碎片合并已在
+        #     规则端执行过，这里不再重复合并，避免双重合并。
+        if self._annotations is not None and line_id in self._annotations:
+            merge_enabled = False
+        else:
+            pp_ver = rule_data.get('postprocess_version', 'baseline')
+            merge_enabled = (pp_ver == 'baseline')
         
         label = LabelGenerator.generate(
             rule_data['chars'], 
             resized_w, 
             image_height,
             scale,
-            merge_enabled=True
+            merge_enabled=merge_enabled
         )
         
         features = features.transpose(1, 0)
