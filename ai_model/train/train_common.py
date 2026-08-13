@@ -5,6 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from pathlib import Path
 import json
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 try:
@@ -52,7 +53,6 @@ def train_epoch(
         
         with torch.amp.autocast(device_type, enabled=use_amp):
             outputs = model(features)
-            outputs = outputs.squeeze(1)
             loss = criterion(outputs, labels)
 
         scaler.scale(loss).backward()
@@ -60,8 +60,8 @@ def train_epoch(
         scaler.update()
         
         train_loss += loss.item() * features.size(0)
-        train_col_acc += column_accuracy(outputs.detach(), labels.detach()).item() * features.size(0)
-        train_iou += interval_iou(outputs.detach(), labels.detach()).item() * features.size(0)
+        train_col_acc += column_accuracy_multiclass(outputs.detach(), labels.detach()).item() * features.size(0)
+        train_iou += interval_iou_multiclass(outputs.detach(), labels.detach()).item() * features.size(0)
         train_count += features.size(0)
         
         if HAS_TQDM:
@@ -97,15 +97,14 @@ def validate_epoch(
             
             with torch.amp.autocast(device_type, enabled=use_amp):
                 outputs = model(features)
-                outputs = outputs.squeeze(1)
                 loss = criterion(outputs, labels)
             
             val_loss += loss.item() * features.size(0)
-            val_col_acc += column_accuracy(outputs, labels).item() * features.size(0)
-            val_iou += interval_iou(outputs, labels).item() * features.size(0)
+            val_col_acc += column_accuracy_multiclass(outputs, labels).item() * features.size(0)
+            val_iou += interval_iou_multiclass(outputs, labels).item() * features.size(0)
             
-            val_roi_iou += roi_interval_iou(outputs, labels, char_width=global_char_width).item() * features.size(0)
-            split_iou = split_interval_iou(outputs, labels, char_width=global_char_width)
+            val_roi_iou += roi_interval_iou_multiclass(outputs, labels, char_width=global_char_width).item() * features.size(0)
+            split_iou = split_interval_iou_multiclass(outputs, labels, char_width=global_char_width)
             val_char_iou += split_iou['char_iou'].item() * features.size(0)
             val_gap_iou += split_iou['gap_iou'].item() * features.size(0)
             
@@ -139,7 +138,8 @@ def train_model(
     model_name: str,
     lr_scheduler_type: str,
     global_char_width: float = 16.0,
-    mode: str = "train"
+    mode: str = "train",
+    no_validation: bool = False
 ) -> Dict:
     best_val_loss = float('inf')
     history = {
@@ -168,14 +168,22 @@ def train_model(
         
         history['learning_rate'].append(current_lr)
         
-        val_loss, val_col_acc, val_iou, val_roi_iou, val_char_iou, val_gap_iou = validate_epoch(
-            model, val_loader, criterion, device, device_type, use_amp, global_char_width
-        )
-        
-        if lr_scheduler_type == "cosine":
-            scheduler.step(epoch)
+        if no_validation:
+            val_loss, val_col_acc, val_iou, val_roi_iou, val_char_iou, val_gap_iou = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            
+            if lr_scheduler_type == "cosine":
+                scheduler.step(epoch)
+            else:
+                scheduler.step(train_loss)
         else:
-            scheduler.step(val_loss)
+            val_loss, val_col_acc, val_iou, val_roi_iou, val_char_iou, val_gap_iou = validate_epoch(
+                model, val_loader, criterion, device, device_type, use_amp, global_char_width
+            )
+            
+            if lr_scheduler_type == "cosine":
+                scheduler.step(epoch)
+            else:
+                scheduler.step(val_loss)
         
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
@@ -191,21 +199,25 @@ def train_model(
             epoch_str = f"Epoch [{epoch+1}/{num_epochs}]"
             lr_str = f"LR={current_lr:.2e}"
             train_str = f"Train: Loss={train_loss:.4f}, ColAcc={train_col_acc:.4f}, IoU={train_iou:.4f}"
-            val_str = f"Val:   Loss={val_loss:.4f}, ColAcc={val_col_acc:.4f}, IoU={val_iou:.4f}"
-            val_roi_str = f"ROI-IoU={val_roi_iou:.4f}, Char-IoU={val_char_iou:.4f}, Gap-IoU={val_gap_iou:.4f}"
             
             if HAS_TQDM:
                 epoch_range.write(f"\n{epoch_str} | {lr_str}")
                 epoch_range.write(f"  {train_str}")
-                epoch_range.write(f"  {val_str}")
-                epoch_range.write(f"  {val_roi_str}")
+                if not no_validation:
+                    val_str = f"Val:   Loss={val_loss:.4f}, ColAcc={val_col_acc:.4f}, IoU={val_iou:.4f}"
+                    val_roi_str = f"ROI-IoU={val_roi_iou:.4f}, Char-IoU={val_char_iou:.4f}, Gap-IoU={val_gap_iou:.4f}"
+                    epoch_range.write(f"  {val_str}")
+                    epoch_range.write(f"  {val_roi_str}")
             else:
                 print(f"{epoch_str} | {lr_str}")
                 print(f"  {train_str}")
-                print(f"  {val_str}")
-                print(f"  {val_roi_str}")
+                if not no_validation:
+                    val_str = f"Val:   Loss={val_loss:.4f}, ColAcc={val_col_acc:.4f}, IoU={val_iou:.4f}"
+                    val_roi_str = f"ROI-IoU={val_roi_iou:.4f}, Char-IoU={val_char_iou:.4f}, Gap-IoU={val_gap_iou:.4f}"
+                    print(f"  {val_str}")
+                    print(f"  {val_roi_str}")
         
-        if val_loss < best_val_loss:
+        if not no_validation and val_loss < best_val_loss:
             best_val_loss = val_loss
             best_path = model_dir / f"{model_name}_best.pth"
             torch.save(model.state_dict(), str(best_path))
@@ -216,10 +228,16 @@ def train_model(
                 print(f"  [INFO] 保存最佳模型: {best_path}")
         
         if HAS_TQDM:
-            epoch_range.set_postfix({
-                "Val Loss": f"{val_loss:.4f}",
-                "Val IoU": f"{val_iou:.4f}"
-            })
+            if no_validation:
+                epoch_range.set_postfix({
+                    "Train Loss": f"{train_loss:.4f}",
+                    "Train IoU": f"{train_iou:.4f}"
+                })
+            else:
+                epoch_range.set_postfix({
+                    "Val Loss": f"{val_loss:.4f}",
+                    "Val IoU": f"{val_iou:.4f}"
+                })
     
     return history
 
@@ -250,15 +268,14 @@ def evaluate_model(
             
             with torch.amp.autocast(device_type, enabled=use_amp):
                 outputs = model(features)
-                outputs = outputs.squeeze(1)
                 loss = criterion(outputs, labels)
             
             val_loss += loss.item() * features.size(0)
-            val_col_acc += column_accuracy(outputs, labels).item() * features.size(0)
-            val_iou += interval_iou(outputs, labels).item() * features.size(0)
+            val_col_acc += column_accuracy_multiclass(outputs, labels).item() * features.size(0)
+            val_iou += interval_iou_multiclass(outputs, labels).item() * features.size(0)
             
-            val_roi_iou += roi_interval_iou(outputs, labels, char_width=global_char_width).item() * features.size(0)
-            split_iou = split_interval_iou(outputs, labels, char_width=global_char_width)
+            val_roi_iou += roi_interval_iou_multiclass(outputs, labels, char_width=global_char_width).item() * features.size(0)
+            split_iou = split_interval_iou_multiclass(outputs, labels, char_width=global_char_width)
             val_char_iou += split_iou['char_iou'].item() * features.size(0)
             val_gap_iou += split_iou['gap_iou'].item() * features.size(0)
             
@@ -287,11 +304,24 @@ def save_model_and_history(
     final_path = model_dir / f"{model_name}_final.pth"
     torch.save(model.state_dict(), str(final_path))
     
+    # 判断训练类型（预训练 / 微调），通过模型名后缀识别
+    training_mode = "finetune" if "finetune" in model_name.lower() else "pretrain"
+    
+    # 在历史中附加训练元信息，方便后续对比和推理侧识别
+    history["_metadata"] = {
+        "model_name": model_name,
+        "training_mode": training_mode,  # pretrain / finetune
+        "final_model_path": str(final_path.name),
+        "best_model_path": f"{model_name}_best.pth",
+        "saved_at": datetime.now().isoformat()
+    }
+    
     history_path = model_dir / history_file
     with open(history_path, 'w', encoding='utf-8') as f:
         json.dump(history, f, indent=2)
     
     print(f"[INFO] 模型保存到: {model_dir}")
+    print(f"[INFO] 训练类型: {training_mode}  |  最终模型: {final_path.name}")
 
 
 def setup_scheduler(
@@ -317,4 +347,158 @@ def setup_scheduler(
         )
 
 
-from ai_model.models.unet1d import column_accuracy, interval_iou, roi_interval_iou, split_interval_iou
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, ignore_index=-100):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.ignore_index = ignore_index
+        self.ce = nn.CrossEntropyLoss(weight=alpha, ignore_index=ignore_index, reduction='none')
+    
+    def forward(self, inputs, targets):
+        ce_loss = self.ce(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean()
+
+
+def column_accuracy_multiclass(pred, target):
+    pred_class = torch.argmax(pred, dim=1)
+    correct = (pred_class == target).float().sum()
+    total = (target != -100).float().sum()
+    return correct / max(total, 1)
+
+
+def interval_iou_multiclass(pred, target, char_width: float = 16.0):
+    pred_class = torch.argmax(pred, dim=1)
+    pred_bin = (pred_class > 0).float()
+    target_bin = (target > 0).float()
+    
+    intersection = (pred_bin * target_bin).sum(dim=-1)
+    union = pred_bin.sum(dim=-1) + target_bin.sum(dim=-1) - intersection
+    
+    smooth = 1e-6
+    iou = (intersection + smooth) / (union + smooth)
+    return iou.mean()
+
+
+def roi_interval_iou_multiclass(pred, target, char_width: float = 16.0):
+    pred_class = torch.argmax(pred, dim=1)
+    pred_bin = (pred_class > 0).float()
+    
+    target_int = target.int()
+    if target_int.dim() == 2:
+        batch_size = target_int.size(0)
+        width = target_int.size(1)
+    else:
+        batch_size = 1
+        width = target_int.size(0)
+        target_int = target_int.unsqueeze(0)
+        pred_bin = pred_bin.unsqueeze(0)
+    
+    total_iou = 0.0
+    count = 0
+    
+    for i in range(batch_size):
+        line_target = target_int[i]
+        diff = line_target[1:] - line_target[:-1]
+        starts = (diff > 0).nonzero(as_tuple=True)[0] + 1
+        ends = (diff < 0).nonzero(as_tuple=True)[0]
+        
+        if line_target[0] > 0:
+            starts = torch.cat([torch.tensor([0], device=line_target.device), starts])
+        if line_target[-1] > 0:
+            ends = torch.cat([ends, torch.tensor([width - 1], device=line_target.device)])
+        
+        if len(starts) == 0 or len(ends) == 0:
+            continue
+        
+        roi_start = max(0, int(starts[0].item() - char_width))
+        roi_end = min(width - 1, int(ends[-1].item() + char_width))
+        
+        if roi_end <= roi_start:
+            continue
+        
+        roi_pred = pred_bin[i, roi_start:roi_end + 1]
+        roi_target = (line_target[roi_start:roi_end + 1] > 0).float()
+        
+        intersection = (roi_pred * roi_target).sum()
+        union = roi_pred.sum() + roi_target.sum() - intersection
+        
+        if union > 0:
+            total_iou += (intersection + 1e-6) / (union + 1e-6)
+            count += 1
+    
+    return total_iou / max(count, 1)
+
+
+def split_interval_iou_multiclass(pred, target, char_width: float = 16.0):
+    pred_class = torch.argmax(pred, dim=1)
+    pred_bin = (pred_class > 0).float()
+    
+    target_int = target.int()
+    if target_int.dim() == 2:
+        batch_size = target_int.size(0)
+        width = target_int.size(1)
+    else:
+        batch_size = 1
+        width = target_int.size(0)
+        target_int = target_int.unsqueeze(0)
+        pred_bin = pred_bin.unsqueeze(0)
+    
+    total_char_iou = 0.0
+    total_gap_iou = 0.0
+    char_count = 0
+    gap_count = 0
+    
+    for i in range(batch_size):
+        line_target = target_int[i]
+        
+        diff = line_target[1:] - line_target[:-1]
+        starts = (diff > 0).nonzero(as_tuple=True)[0] + 1
+        ends = (diff < 0).nonzero(as_tuple=True)[0]
+        
+        if line_target[0] > 0:
+            starts = torch.cat([torch.tensor([0], device=line_target.device), starts])
+        if line_target[-1] > 0:
+            ends = torch.cat([ends, torch.tensor([width - 1], device=line_target.device)])
+        
+        if len(starts) == 0 or len(ends) == 0:
+            continue
+        
+        char_mask = (line_target > 0).float()
+        char_pred = pred_bin[i]
+        char_intersection = (char_pred * char_mask).sum()
+        char_union = char_pred.sum() + char_mask.sum() - char_intersection
+        
+        if char_mask.sum() > 0:
+            total_char_iou += (char_intersection + 1e-6) / (char_union + 1e-6) if char_union > 0 else 0
+            char_count += 1
+        
+        gap_intersection = 0.0
+        gap_union = 0.0
+        
+        for j in range(len(ends)):
+            if j < len(starts) - 1:
+                gap_start = ends[j] + 1
+                gap_end = starts[j + 1] - 1
+                gap_width = gap_end - gap_start + 1
+                
+                if gap_width > 0 and gap_width <= char_width:
+                    gap_pred = pred_bin[i, gap_start:gap_end + 1]
+                    gap_tgt = (line_target[gap_start:gap_end + 1] > 0).float()
+                    
+                    gap_pred_inv = 1.0 - gap_pred
+                    gap_tgt_inv = 1.0 - gap_tgt
+                    
+                    gap_intersection += (gap_pred_inv * gap_tgt_inv).sum()
+                    gap_union += gap_pred_inv.sum() + gap_tgt_inv.sum() - (gap_pred_inv * gap_tgt_inv).sum()
+        
+        if gap_union > 0:
+            total_gap_iou += (gap_intersection + 1e-6) / (gap_union + 1e-6)
+            gap_count += 1
+    
+    return {
+        'char_iou': total_char_iou / max(char_count, 1),
+        'gap_iou': total_gap_iou / max(gap_count, 1)
+    }

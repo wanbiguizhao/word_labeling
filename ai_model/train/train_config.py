@@ -43,10 +43,18 @@ class TrainConfig:
 
 @dataclass
 class FineTuneConfig(TrainConfig):
+    # 微调模型默认使用带 _finetune 后缀的名称，避免与预训练产物混淆
+    model_name: str = "char_segment_1d_unet_finetune"
+    
     annotations_file: Optional[str] = None
     
     pretrained_model_path: Optional[str] = None
     
     freeze_layers: bool = False
+
+    # 微调学习率：原默认 1e-5 过小，经过诊断发现权重几乎完全没学到
+    # （卷积参数相对 L2 偏移 ≈ 0.0000），仅 BN 统计量漂移导致效果变差。
+    # 提升到 5e-4 让 GT 标注真正有能力纠正预训练权重。
+    fine_tune_lr: float = 5e-4
     
-    fine_tune_lr: float = 1e-5
+    no_validation: bool = False

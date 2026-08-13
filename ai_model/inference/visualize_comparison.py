@@ -30,82 +30,26 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(BASE_DIR))
 
 from ai_model.inference.infer import CharSegmentPredictor
+from ai_model.common.cut_line_converter import (
+    intervals_to_positions,
+    START_COLOR_RGB,
+    END_COLOR_RGB,
+    SHARED_COLOR_RGB
+)
 
 
 # ===================== 可视化配置 =====================
 SEP_LINE_COLOR = (128, 0, 128)    # 紫色分隔线
 SEP_LINE_WIDTH = 2                 # 分隔线宽度
 CUT_LINE_WIDTH = 1                 # 切割线宽度
-START_COLOR = (255, 0, 0)          # 红色 = 字符起点
-END_COLOR = (0, 255, 0)            # 绿色 = 字符终点
+START_COLOR = START_COLOR_RGB      # 红色 = 字符起点
+END_COLOR = END_COLOR_RGB          # 绿色 = 字符终点
+SHARED_COLOR = SHARED_COLOR_RGB    # 紫色 = 共享边界
 PROB_HEIGHT = 51                   # 概率图高度（像素）
 PROB_MAX_PIXEL = 50                # 概率条最大高度
 
 
-# ===================== 合并后处理默认参数 =====================
-DEFAULT_MERGE_MIN_GAP = 3          # 最小间隙（与 segment_config.py 保持一致）
-DEFAULT_MERGE_SINGLE_RATIO = 0.7   # 单字符宽高比上限
-DEFAULT_MERGE_MIN_RATIO = 0.5      # 合并后宽高比下限
-DEFAULT_MERGE_MAX_RATIO = 1.5      # 合并后宽高比上限
 
-
-# ===================== 合并后处理函数 =====================
-
-def merge_rule_intervals(
-    intervals: List[Tuple[int, int]],
-    image_height: int,
-    min_gap: int = DEFAULT_MERGE_MIN_GAP,
-    single_ratio: float = DEFAULT_MERGE_SINGLE_RATIO,
-    min_ratio: float = DEFAULT_MERGE_MIN_RATIO,
-    max_ratio: float = DEFAULT_MERGE_MAX_RATIO
-) -> List[Tuple[int, int]]:
-    """
-    模拟 postprocess_merge_chars 的合并逻辑
-
-    合并条件（全部满足才合并）：
-      1. 间隙 < min_gap
-      2. 两个字符都窄（width/height < single_ratio）
-      3. 合并后的宽高比在 [min_ratio, max_ratio] 范围内
-
-    Args:
-        intervals: [(start, end), ...] 按列排序的区间
-        image_height: 行图像高度（作为字符高度）
-        min_gap: 最小间隙像素数
-        single_ratio: 单字符宽高比上限
-        min_ratio: 合并后宽高比下限
-        max_ratio: 合并后宽高比上限
-
-    Returns:
-        合并后的区间列表
-    """
-    if len(intervals) < 2:
-        return intervals[:]
-
-    merged = [intervals[0]]
-
-    for current in intervals[1:]:
-        last = merged[-1]
-        gap = current[0] - last[1] - 1
-
-        if gap >= 0 and gap < min_gap:
-            w1 = last[1] - last[0]
-            w2 = current[1] - current[0]
-            r1 = w1 / image_height
-            r2 = w2 / image_height
-
-            # 条件2：两个字符都窄
-            if r1 < single_ratio and r2 < single_ratio:
-                merged_w = current[1] - last[0]
-                merged_r = merged_w / image_height
-
-                # 条件3：合并后比例合理
-                if min_ratio < merged_r < max_ratio:
-                    merged[-1] = (last[0], current[1])
-                    continue
-
-        merged.append(current)
-
-    return merged
 
 
 def load_rule_intervals(rule_json_path: Path) -> List[Tuple[int, int]]:
@@ -131,37 +75,81 @@ def load_rule_intervals(rule_json_path: Path) -> List[Tuple[int, int]]:
     return intervals
 
 
-def compute_prob_map(pred_prob: np.ndarray, orig_width: int, scale: float) -> Tuple[np.ndarray, np.ndarray]:
+def load_lineage_intervals(lineage_path: Path, line_id: str) -> List[Tuple[int, int]]:
+    """
+    从 lineage.json 中读取后处理合并后的字符区间
+
+    Args:
+        lineage_path: lineage.json 文件路径
+        line_id: 行ID
+
+    Returns:
+        [(start, end), ...] 字符区间列表（已合并后的数据）
+    """
+    if not lineage_path.exists():
+        return []
+
+    with open(lineage_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    lines = data.get('lines', {})
+    chars = data.get('chars', {})
+
+    line_info = lines.get(line_id)
+    if not line_info:
+        return []
+
+    char_ids = line_info.get('chars', [])
+    intervals = []
+    for cid in char_ids:
+        char_info = chars.get(cid)
+        if char_info:
+            start = char_info.get('col_start', 0)
+            end = char_info.get('col_end', 0)
+            if end > start:
+                intervals.append((start, end))
+
+    return intervals
+
+
+def compute_prob_map(pred_prob: np.ndarray, orig_width: int, scale: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     将模型概率映射回原始图像宽度（用于可视化，无阈值截断）
 
     Args:
-        pred_prob: sigmoid后的概率数组（0-1之间，缩放后宽度）
+        pred_prob: softmax后的概率数组（3通道：[空白概率, 边界概率, 内部概率]）
         orig_width: 原始图像宽度
         scale: 缩放比例
 
     Returns:
-        (prob_map, bar_heights) 映射到原始宽度的概率和条高度
+        (max_prob_map, class_map, bar_heights, blank_prob_map) 
+            最大概率图、类别图、条高度、空白概率图
+            class_map: 0=空白, 1=边界, 2=内部
     """
     inv_scale = 1.0 / scale if scale > 0 else 1.0
-    resized_w = len(pred_prob)
+    n_channels, resized_w = pred_prob.shape
 
-    prob_map = np.zeros(orig_width, dtype=np.float32)
+    max_prob_map = np.zeros(orig_width, dtype=np.float32)
+    class_map = np.zeros(orig_width, dtype=np.int32)
     count_map = np.zeros(orig_width, dtype=np.int32)
 
     for resized_col in range(resized_w):
-        prob = pred_prob[resized_col]
+        max_prob = np.max(pred_prob[:, resized_col])
+        max_class = np.argmax(pred_prob[:, resized_col])
+        
         orig_col = int(round(resized_col * inv_scale))
         orig_col = min(max(orig_col, 0), orig_width - 1)
-        prob_map[orig_col] += prob
+        
+        max_prob_map[orig_col] += max_prob
+        class_map[orig_col] = max_class
         count_map[orig_col] += 1
 
     mask = count_map > 0
-    prob_map[mask] /= count_map[mask]
+    max_prob_map[mask] /= count_map[mask]
 
-    bar_heights = np.maximum(1, np.round(prob_map * PROB_MAX_PIXEL)).astype(np.int32)
+    bar_heights = np.maximum(1, np.round(max_prob_map * PROB_MAX_PIXEL)).astype(np.int32)
 
-    return prob_map, bar_heights
+    return max_prob_map, class_map, bar_heights
 
 
 def draw_comparison(
@@ -223,9 +211,14 @@ def draw_comparison(
     # =====================================
     rule_img = base_img.copy()
     d_rule = ImageDraw.Draw(rule_img)
-    for s, e in rule_intervals:
+    
+    rule_starts, rule_ends, rule_shared = intervals_to_positions(rule_intervals)
+    for s in rule_starts:
         d_rule.line([(s, 0), (s, H)], fill=START_COLOR, width=CUT_LINE_WIDTH)
+    for e in rule_ends:
         d_rule.line([(e, 0), (e, H)], fill=END_COLOR, width=CUT_LINE_WIDTH)
+    for s in rule_shared:
+        d_rule.line([(s, 0), (s, H)], fill=SHARED_COLOR, width=CUT_LINE_WIDTH)
     canvas.paste(rule_img, (0, current_y))
     current_y += H
 
@@ -239,9 +232,14 @@ def draw_comparison(
         # =====================================
         rule_merge_img = base_img.copy()
         d_rule_merge = ImageDraw.Draw(rule_merge_img)
-        for s, e in rule_intervals_merged:
+        
+        rm_starts, rm_ends, rm_shared = intervals_to_positions(rule_intervals_merged)
+        for s in rm_starts:
             d_rule_merge.line([(s, 0), (s, H)], fill=START_COLOR, width=CUT_LINE_WIDTH)
+        for e in rm_ends:
             d_rule_merge.line([(e, 0), (e, H)], fill=END_COLOR, width=CUT_LINE_WIDTH)
+        for s in rm_shared:
+            d_rule_merge.line([(s, 0), (s, H)], fill=SHARED_COLOR, width=CUT_LINE_WIDTH)
         canvas.paste(rule_merge_img, (0, current_y))
         current_y += H
 
@@ -254,9 +252,14 @@ def draw_comparison(
     # =====================================
     model_img = base_img.copy()
     d_model = ImageDraw.Draw(model_img)
-    for s, e in model_intervals:
+    
+    model_starts, model_ends, model_shared = intervals_to_positions(model_intervals)
+    for s in model_starts:
         d_model.line([(s, 0), (s, H)], fill=START_COLOR, width=CUT_LINE_WIDTH)
+    for e in model_ends:
         d_model.line([(e, 0), (e, H)], fill=END_COLOR, width=CUT_LINE_WIDTH)
+    for s in model_shared:
+        d_model.line([(s, 0), (s, H)], fill=SHARED_COLOR, width=CUT_LINE_WIDTH)
     canvas.paste(model_img, (0, current_y))
     current_y += H
 
@@ -264,19 +267,30 @@ def draw_comparison(
     draw.line([(0, current_y), (W, current_y)], fill=SEP_LINE_COLOR, width=sep)
 
     # =====================================
-    # 最后行：概率热力图（使用sigmoid后的真实概率值，无阈值截断）
+    # 最后行：概率热力图（使用softmax后的真实概率值，无阈值截断）
+    # 颜色映射：内部=红色, 边界=黄色, 空白=蓝色, 高度=概率大小
     # =====================================
-    prob_map, bar_heights = compute_prob_map(pred_prob, W, scale)
+    max_prob_map, class_map, bar_heights = compute_prob_map(pred_prob, W, scale)
 
     for col in range(W):
-        prob = prob_map[col]
-        bar_height = max(1, int(round(prob * PROB_MAX_PIXEL)))
+        max_prob = max_prob_map[col]
+        pred_class = class_map[col]
+        bar_height = bar_heights[col]
         y_start = total_height - bar_height
         y_end = total_height
         
-        r = int(255 * prob)
-        g = int(0)
-        b = int(0)
+        if pred_class == 2:
+            r = int(255 * max_prob)
+            g = 0
+            b = 0
+        elif pred_class == 1:
+            r = int(255 * max_prob)
+            g = int(255 * max_prob)
+            b = 0
+        else:
+            r = 0
+            g = 0
+            b = int(255 * max_prob)
         
         draw.line([(col, y_start), (col, y_end)], fill=(r, g, b), width=1)
 
@@ -303,33 +317,21 @@ def draw_comparison(
               help="可视化结果保存目录")
 @click.option("--max-gap", type=int, default=2, show_default=True,
               help="模型合并间隙（特征像素，设为 -1 禁用合并）")
-@click.option("--merge-min-gap", type=int, default=DEFAULT_MERGE_MIN_GAP,
-              show_default=True, help="规则后处理合并：最小间隙")
-@click.option("--merge-single-ratio", type=float, default=DEFAULT_MERGE_SINGLE_RATIO,
-              show_default=True, help="规则后处理合并：单字符宽高比上限")
-@click.option("--merge-min-ratio", type=float, default=DEFAULT_MERGE_MIN_RATIO,
-              show_default=True, help="规则后处理合并：合并后宽高比下限")
-@click.option("--merge-max-ratio", type=float, default=DEFAULT_MERGE_MAX_RATIO,
-              show_default=True, help="规则后处理合并：合并后宽高比上限")
 @click.option("--threshold", type=float, default=0.3, show_default=True,
               help="模型预测概率阈值")
 def cli(line_id, data_base_path, model_path, image_path, rule_json_path, save_dir,
-        max_gap, merge_min_gap, merge_single_ratio, merge_min_ratio, merge_max_ratio,
-        threshold):
+        max_gap, threshold):
     """
     对比规则与模型的切割结果
 
     生成多层对比可视化图：
     第1行：原始行图像
     第2行：规则切割结果（原始间隔）
-    第3行：规则切割结果（后处理合并后）
+    第3行：规则切割结果（后处理合并后，从 lineage.json 读取）
     第4行：模型预测结果
     第5行：模型概率热力图
 
-    规则后处理合并条件（与 segment_manager 一致）：
-    1. 两个字符间隙 < --merge-min-gap 像素
-    2. 两个字符都窄（width/height < --merge-single-ratio）
-    3. 合并后宽高比在 [--merge-min-ratio, --merge-max-ratio] 范围
+    规则后处理合并数据直接从 lineage.json 读取，不自行进行后处理操作。
     """
     # 确定文件路径
     if image_path:
@@ -353,31 +355,23 @@ def cli(line_id, data_base_path, model_path, image_path, rule_json_path, save_di
     if rule_json.exists():
         rule_intervals = load_rule_intervals(rule_json)
         click.echo(f"[INFO] 规则切割区间（合并前）: {len(rule_intervals)} 个字符")
-
-        # 读取行图像（用于合并计算和后续模型推理共用）
-        img = cv2.imread(str(line_path), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            click.echo(f"[ERROR] 无法读取图像: {line_path}", err=True)
-            sys.exit(1)
-
-        # 计算后处理合并后的区间
-        rule_intervals_merged = merge_rule_intervals(
-            rule_intervals,
-            image_height=img.shape[0],
-            min_gap=merge_min_gap,
-            single_ratio=merge_single_ratio,
-            min_ratio=merge_min_ratio,
-            max_ratio=merge_max_ratio
-        )
-        click.echo(f"[INFO] 规则切割区间（合并后）: {len(rule_intervals_merged)} 个字符"
-                   f"（合并了 {len(rule_intervals) - len(rule_intervals_merged)} 对）")
     else:
         click.echo(f"[WARN] 规则 JSON 不存在: {rule_json}")
-        # 没有规则JSON时仍需读取图像用于模型推理
-        img = cv2.imread(str(line_path), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            click.echo(f"[ERROR] 无法读取图像: {line_path}", err=True)
-            sys.exit(1)
+
+    # 从 lineage.json 读取后处理合并后的区间
+    data_path = Path(data_base_path) if data_base_path else BASE_DIR / "datahome"
+    lineage_path = data_path / "lineage.json"
+    rule_intervals_merged = load_lineage_intervals(lineage_path, line_id)
+    if rule_intervals_merged:
+        click.echo(f"[INFO] 规则切割区间（合并后，来自 lineage.json）: {len(rule_intervals_merged)} 个字符")
+    else:
+        click.echo(f"[WARN] lineage.json 中未找到 {line_id} 的后处理数据")
+
+    # 读取行图像（用于模型推理）
+    img = cv2.imread(str(line_path), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        click.echo(f"[ERROR] 无法读取图像: {line_path}", err=True)
+        sys.exit(1)
 
     # 加载模型
     model_file = Path(model_path) if model_path else BASE_DIR / "ai_model" / "models" / "char_segment_1d_unet_best.pth"
@@ -394,13 +388,11 @@ def cli(line_id, data_base_path, model_path, image_path, rule_json_path, save_di
     click.echo(f"[INFO] 模型预测区间: {len(model_intervals)} 个字符")
     
     click.echo(f"[DEBUG] 概率统计:")
-    click.echo(f"  概率平均值: {np.mean(pred_prob):.4f}")
-    click.echo(f"  概率最大值: {np.max(pred_prob):.4f}")
-    click.echo(f"  概率最小值: {np.min(pred_prob):.4f}")
-    click.echo(f"  大于阈值({threshold})的列数: {np.sum(pred_prob > threshold)}/{len(pred_prob)}")
-    click.echo(f"  大于0.5的列数: {np.sum(pred_prob > 0.5)}/{len(pred_prob)}")
+    click.echo(f"  空白类平均概率: {np.mean(pred_prob[0]):.4f}")
+    click.echo(f"  边界类平均概率: {np.mean(pred_prob[1]):.4f}")
+    click.echo(f"  内部类平均概率: {np.mean(pred_prob[2]):.4f}")
     click.echo(f"  缩放比例: {scale:.4f}")
-    click.echo(f"  原始宽度: {img.shape[1]}, 缩放后宽度: {len(pred_prob)}")
+    click.echo(f"  原始宽度: {img.shape[1]}, 缩放后宽度: {pred_prob.shape[1]}")
 
     save_dir_path = Path(save_dir) if save_dir else line_path.parent.parent / "visualization"
     save_path = save_dir_path / f"{line_path.stem}_comparison.png"
@@ -410,12 +402,13 @@ def cli(line_id, data_base_path, model_path, image_path, rule_json_path, save_di
     click.echo(f"\n{'='*50}")
     click.echo("切割对比统计")
     click.echo(f"{'='*50}")
-    click.echo(f"  规则切割（合并前）: {len(rule_intervals)} 字符")
+    click.echo(f"  规则切割（原始）: {len(rule_intervals)} 字符")
     if rule_intervals_merged:
-        click.echo(f"  规则切割（合并后）: {len(rule_intervals_merged)} 字符"
-                   f"（合并 {len(rule_intervals) - len(rule_intervals_merged)} 对）")
+        click.echo(f"  规则切割（后处理，来自 lineage.json）: {len(rule_intervals_merged)} 字符")
+        if rule_intervals:
+            click.echo(f"  （较原始减少 {len(rule_intervals) - len(rule_intervals_merged)} 个）")
     click.echo(f"  模型预测: {len(model_intervals)} 字符")
-    click.echo(f"  概率平均值: {np.mean(pred_prob):.4f}")
+    click.echo(f"  字符类平均概率: {np.mean(pred_prob[1:]):.4f}")
 
 
 if __name__ == "__main__":

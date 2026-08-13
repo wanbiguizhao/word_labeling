@@ -63,7 +63,24 @@ class OutConv(nn.Module):
 
 
 class UNet1D(nn.Module):
-    def __init__(self, n_channels=6, n_classes=1):
+    """
+    1D U-Net 模型，用于字符分割任务
+    
+    类别定义（3类标注方案，支持共享边界）：
+        0 = 空白区域（字符外部）
+        1 = 边界（字符起始/结束，支持共享边界）
+        2 = 字符内部（非边界的字符区域）
+    
+    共享边界支持：
+        当两个字符共享边界时（char1.col_end == char2.col_start），
+        该位置被标记为边界(1)，解码器会将其识别为上一个字符的结束
+        和下一个字符的开始，从而实现用一根线划分两个字符。
+    
+    Args:
+        n_channels: 输入特征通道数（默认6，对应6维特征）
+        n_classes: 输出类别数（默认3，对应空白/边界/内部）
+    """
+    def __init__(self, n_channels=6, n_classes=3):
         super(UNet1D, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes

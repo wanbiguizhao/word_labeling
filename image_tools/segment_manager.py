@@ -90,6 +90,7 @@ import sys
 import json
 import shutil
 import time
+import gc
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -112,6 +113,12 @@ sys.path.append(str(BASE_DIR))
 from image_tools.pdf_config import Pdf2ImageConfig
 from image_tools.image_config import Image2LineConfig
 from image_tools.segment_config import Line2CharConfig
+from image_tools.postprocess_chain import (
+    resolve_config_path,
+    load_config as load_pp_config,
+    run_chain as run_pp_chain,
+    get_default_config as get_default_pp_config,
+)
 from image_tools.imageCore import (
     CharSegmentConfig, TextLineDetector, VerticalProjectionSegmenter
 )
@@ -174,20 +181,38 @@ class SegmentManager:
         
         char_cfg.init_directories(data_base_path)
         
+        # 加载后处理链配置
+        self._pp_config = self._load_postprocess_config()
+        
         self.lineage = self._load_or_init_lineage()
         self._save_pending = False
     
+    def _load_postprocess_config(self) -> Dict:
+        """加载后处理链配置"""
+        config_name = self.char_cfg.postprocess_chain_config
+        if not config_name or config_name == "baseline":
+            return get_default_pp_config()
+        try:
+            config_path = resolve_config_path(config_name)
+            if config_path.exists():
+                cfg = load_pp_config(config_path)
+                print(f"  [POSTCHAIN] 加载后处理配置: {config_name} (版本: {cfg.get('version', '?')})")
+                return cfg
+            else:
+                print(f"  [POSTCHAIN] 配置文件不存在: {config_path}，使用基线")
+                return get_default_pp_config()
+        except Exception as e:
+            print(f"  [POSTCHAIN] 加载配置失败: {e}，使用基线")
+            return get_default_pp_config()
+    
     def _load_or_init_lineage(self) -> Dict:
-        """加载或初始化血缘索引"""
-        lineage_path = self.data_base_path / "lineage.json"
+        """
+        初始化空的血缘索引（不全量加载 lineage.json）
         
-        if lineage_path.exists():
-            try:
-                with open(lineage_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                pass
-        
+        lineage.json 可能有 1+ GB 的历史数据，全量加载会占用 2+ GB 内存。
+        处理过程中所有读写都是当前 PDF 的增量数据，不需要历史数据。
+        保存时通过 _save_lineage 增量合并到磁盘文件。
+        """
         return {
             "metadata": {
                 "version": "1.0",
@@ -205,19 +230,60 @@ class SegmentManager:
         }
     
     def _save_lineage(self, force: bool = False) -> None:
-        """保存血缘索引到文件（支持延迟写入）"""
+        """
+        增量合并保存血缘索引到文件
+        
+        分两步避免内存峰值：
+        1. 读取旧 lineage.json → update 增量 → 写回（单次 I/O）
+        2. 旧数据在 update 后立即释放
+        
+        如果 lineage.json 不存在或为空，直接写入当前增量。
+        """
         if not force and not self._save_pending:
             return
-        
+
         lineage_path = self.data_base_path / "lineage.json"
+        
+        # 读取磁盘上的旧数据
+        existing = {}
+        if lineage_path.exists():
+            try:
+                with open(lineage_path, 'r', encoding='utf-8') as f:
+                    existing = json.load(f)
+            except Exception:
+                existing = {}
+        
+        # 合并增量数据
+        for key in ("pdfs", "pages", "lines", "chars"):
+            existing.setdefault(key, {}).update(self.lineage.get(key, {}))
+        existing["metadata"] = self.lineage["metadata"]
+        
+        # 写回磁盘
         with open(lineage_path, 'w', encoding='utf-8') as f:
-            json.dump(self.lineage, f, ensure_ascii=False, indent=2, default=str)
+            json.dump(existing, f, ensure_ascii=False, indent=2, default=str)
+        
+        # 释放旧数据
+        del existing
+        gc.collect()
         
         self._save_pending = False
     
     def _mark_dirty(self) -> None:
         """标记血缘索引需要保存"""
         self._save_pending = True
+    
+    def _reset_lineage_increment(self) -> None:
+        """
+        清空内存中的 lineage 增量数据（已通过 _save_lineage 增量合并到磁盘）
+        
+        用于串行批量处理：每个 PDF 处理完并保存后，清空内存中的增量，
+        避免多个 PDF 的 lineage 数据在内存中累积。
+        """
+        self.lineage["pdfs"].clear()
+        self.lineage["pages"].clear()
+        self.lineage["lines"].clear()
+        self.lineage["chars"].clear()
+        gc.collect()
     
     def _generate_id(self, prefix: str, *args) -> str:
         """生成唯一ID"""
@@ -234,6 +300,7 @@ class SegmentManager:
         Returns:
             (success, page_ids)
         """
+        doc = None
         try:
             pdf_filename = Path(pdf_path).name
             pdf_id = self._generate_id("pdf", Path(pdf_path).stem)
@@ -289,8 +356,9 @@ class SegmentManager:
                 }
                 pages_ref[page_id] = page_info
                 page_ids[idx] = page_id
-            
-            doc.close()
+                
+                # 释放 pix 对象（避免高分辨率页面图像累积）
+                del pix
             
             self.lineage["pdfs"][pdf_id] = {
                 "pdf_id": pdf_id,
@@ -304,6 +372,9 @@ class SegmentManager:
             
         except Exception as e:
             return False, [str(e)]
+        finally:
+            if doc is not None:
+                doc.close()
     
     @staticmethod
     def _fast_line_detection(image_path: str, cfg: CharSegmentConfig) -> Tuple[List[Tuple[int, int]], np.ndarray, int, int]:
@@ -478,6 +549,10 @@ class SegmentManager:
                             "width": int(end - start)
                         })
                 
+                # 后处理链：按配置顺序执行（合并碎片、过滤脏点等）
+                pp_context = {"line_id": line_id, "image_width": w, "image_height": h}
+                chars = run_pp_chain(chars, self._pp_config, pp_context)
+                
                 rule_result = {
                     "line_id": line_id,
                     "image_path": str(line_path.relative_to(self.data_base_path)),
@@ -488,6 +563,7 @@ class SegmentManager:
                     "image_height": h,
                     "total_segments": len(segments),
                     "segmentation_version": seg_version,
+                    "postprocess_version": self._pp_config.get("version", "baseline"),
                     "created_at": created_at
                 }
                 
@@ -505,6 +581,110 @@ class SegmentManager:
         
         self._mark_dirty()
         return results
+    
+    def reprocess_rule_jsons(self, config_name: str = None, line_ids: List[str] = None) -> Dict:
+        """
+        对已有的 rule_json 重新应用后处理链（不重新读取图像、不重新切割）
+        
+        读取 rule_json → 提取 chars → 应用后处理链 → 写回 rule_json
+        
+        Args:
+            config_name: 后处理链配置名（如 "merge_fragments_gap3"）。
+                         None 表示使用 segment_config 中的默认配置。
+            line_ids: 指定处理的行ID列表。None 表示处理所有 rule_json。
+        
+        Returns:
+            统计信息 {"total": N, "processed": N, "changed": N, "failed": N}
+        """
+        rule_json_dir = self.data_base_path / self.char_cfg.rule_json_dir
+        if not rule_json_dir.exists():
+            print(f"[ERROR] rule_jsons 目录不存在: {rule_json_dir}")
+            return {"total": 0, "processed": 0, "changed": 0, "failed": 0}
+        
+        # 加载指定的后处理链配置
+        if config_name and config_name != "baseline":
+            config_path = resolve_config_path(config_name)
+            if config_path.exists():
+                pp_config = load_pp_config(config_path)
+                print(f"  [POSTCHAIN] 使用配置: {config_name} (版本: {pp_config.get('version', '?')})")
+            else:
+                print(f"  [POSTCHAIN] 配置文件不存在: {config_path}，使用默认配置")
+                pp_config = self._pp_config
+        else:
+            pp_config = self._pp_config
+        
+        pp_version = pp_config.get("version", "baseline")
+        
+        # 收集要处理的文件
+        if line_ids:
+            rule_files = [rule_json_dir / f"{lid}_rule.json" for lid in line_ids]
+            rule_files = [f for f in rule_files if f.exists()]
+        else:
+            rule_files = sorted(rule_json_dir.glob("*_rule.json"))
+        
+        total = len(rule_files)
+        processed = 0
+        changed = 0
+        failed = 0
+        
+        print(f"\n[Reprocess] 共 {total} 个 rule_json，配置: {pp_version}")
+        print(f"  输入目录: {rule_json_dir}")
+        
+        for i, rule_file in enumerate(rule_files):
+            if (i + 1) % 500 == 0:
+                print(f"  进度: {i + 1}/{total}")
+            
+            try:
+                with open(rule_file, 'r', encoding='utf-8') as f:
+                    rule_data = json.load(f)
+                
+                # 提取原始 chars（从 segments_type_start_end 重建，确保是切割原始结果）
+                # 如果有 segments_type_start_end，从它重建；否则用现有 chars
+                if "segments_type_start_end" in rule_data:
+                    original_chars = []
+                    for seg_type, start, end in rule_data["segments_type_start_end"]:
+                        if seg_type == 1:
+                            original_chars.append({
+                                "col_start": int(start),
+                                "col_end": int(end),
+                                "width": int(end - start)
+                            })
+                else:
+                    original_chars = [dict(c) for c in rule_data.get("chars", [])]
+                
+                # 应用后处理链
+                image_width = rule_data.get("image_width", 0)
+                image_height = rule_data.get("image_height", 0)
+                line_id = rule_data.get("line_id", rule_file.stem.replace("_rule", ""))
+                pp_context = {"line_id": line_id, "image_width": image_width, "image_height": image_height}
+                new_chars = run_pp_chain(original_chars, pp_config, pp_context, verbose=False)
+                
+                # 检查是否有变化
+                old_chars = rule_data.get("chars", [])
+                char_changed = len(old_chars) != len(new_chars) or \
+                    any(o["col_start"] != n["col_start"] or o["col_end"] != n["col_end"]
+                        for o, n in zip(old_chars, new_chars))
+                
+                if char_changed:
+                    changed += 1
+                
+                # 更新并写回
+                rule_data["chars"] = new_chars
+                rule_data["total_chars"] = len(new_chars)
+                rule_data["postprocess_version"] = pp_version
+                
+                with open(rule_file, 'w', encoding='utf-8') as f:
+                    json.dump(rule_data, f, ensure_ascii=False, separators=(',', ':'))
+                
+                processed += 1
+                
+            except Exception as e:
+                print(f"  [ERROR] 处理失败: {rule_file.name} - {e}")
+                failed += 1
+                continue
+        
+        print(f"\n[Reprocess] 完成: 处理 {processed}/{total}, 变更 {changed}, 失败 {failed}")
+        return {"total": total, "processed": processed, "changed": changed, "failed": failed}
     
     def extract_char_images(self, line_id: str, rule_data: Dict) -> List[str]:
         """
@@ -761,6 +941,10 @@ class SegmentManager:
         timings["extract_chars"] = t2 - t1
         print(f"   提取 {total_chars} 个汉字 | 耗时: {timings['extract_chars']:.2f}s")
         
+        # 释放 rule_results（数据已写入磁盘和 lineage，不再需要）
+        del rule_results
+        gc.collect()
+        
         t1 = time.time()
         print(f"[5/5] 后处理：合并粘连字符...")
         self.postprocess_merge_chars()
@@ -896,6 +1080,10 @@ class SegmentManager:
         t2 = time.time()
         timings["extract_chars"] = t2 - t1
         print(f"   提取 {total_chars} 个汉字 | 耗时: {timings['extract_chars']:.2f}s")
+        
+        # 释放 rule_results（数据已写入磁盘和 lineage，不再需要）
+        del rule_results
+        gc.collect()
         
         t1 = time.time()
         print(f"[5/5] 后处理：合并粘连字符...")
@@ -1049,6 +1237,10 @@ class SegmentManager:
                             "width": int(end - start)
                         })
                 
+                # 后处理链：按配置顺序执行
+                pp_context = {"line_id": line_id, "image_width": w, "image_height": h}
+                chars = run_pp_chain(chars, self._pp_config, pp_context)
+                
                 rule_result = {
                     "line_id": line_id,
                     "image_path": str(line_path.relative_to(self.data_base_path)),
@@ -1059,6 +1251,7 @@ class SegmentManager:
                     "image_height": h,
                     "total_segments": len(segments),
                     "segmentation_version": seg_version,
+                    "postprocess_version": self._pp_config.get("version", "baseline"),
                     "created_at": created_at
                 }
                 
@@ -1264,6 +1457,15 @@ def run_segment_batch(
     if parallel and selected_count > 1:
         print(f"\n[BATCH] 启动PDF级别并行处理 ({max_workers} 进程)...")
         
+        # 增量合并：每完成一个PDF立即合并到segment_manager，不累积all_lineages列表
+        segment_manager = SegmentManager(
+            pdf_cfg=pdf_cfg,
+            img_cfg=img_cfg,
+            char_cfg=char_cfg,
+            data_base_path=data_base_path
+        )
+        completed_count = 0
+        
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             future_to_pdf = {
                 executor.submit(
@@ -1274,9 +1476,6 @@ def run_segment_batch(
                 ): pdf_path for pdf_path in selected_files
             }
             
-            all_lineages = []
-            completed_count = 0
-            
             if HAS_TQDM:
                 with tqdm(total=selected_count, desc="[BATCH] 并行处理进度", unit="pdf",
                           bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
@@ -1286,7 +1485,12 @@ def run_segment_batch(
                         
                         try:
                             lineage = future.result()
-                            all_lineages.append(lineage)
+                            # 立即合并到 segment_manager，然后 del 释放内存
+                            segment_manager.lineage["pdfs"].update(lineage.get("pdfs", {}))
+                            segment_manager.lineage["pages"].update(lineage.get("pages", {}))
+                            segment_manager.lineage["lines"].update(lineage.get("lines", {}))
+                            segment_manager.lineage["chars"].update(lineage.get("chars", {}))
+                            del lineage
                             pbar.set_postfix({"完成": pdf_path.name})
                         except Exception as e:
                             print(f"\n[ERROR] 处理失败: {pdf_path.name} - {str(e)}")
@@ -1299,27 +1503,18 @@ def run_segment_batch(
                     
                     try:
                         lineage = future.result()
-                        all_lineages.append(lineage)
+                        segment_manager.lineage["pdfs"].update(lineage.get("pdfs", {}))
+                        segment_manager.lineage["pages"].update(lineage.get("pages", {}))
+                        segment_manager.lineage["lines"].update(lineage.get("lines", {}))
+                        segment_manager.lineage["chars"].update(lineage.get("chars", {}))
+                        del lineage
                         elapsed = time.time() - start_time
                         progress = _format_progress_bar(completed_count, selected_count)
                         print(f"[BATCH] {progress} [{completed_count}/{selected_count}] 完成: {pdf_path.name} | 已用时: {_format_time(elapsed)}")
                     except Exception as e:
                         print(f"[ERROR] 处理失败: {pdf_path.name} - {str(e)}")
         
-        print(f"\n[BATCH] 合并 {len(all_lineages)} 个PDF的血缘索引...")
-        segment_manager = SegmentManager(
-            pdf_cfg=pdf_cfg,
-            img_cfg=img_cfg,
-            char_cfg=char_cfg,
-            data_base_path=data_base_path
-        )
-        
-        for lineage in all_lineages:
-            segment_manager.lineage["pdfs"].update(lineage.get("pdfs", {}))
-            segment_manager.lineage["pages"].update(lineage.get("pages", {}))
-            segment_manager.lineage["lines"].update(lineage.get("lines", {}))
-            segment_manager.lineage["chars"].update(lineage.get("chars", {}))
-        
+        print(f"\n[BATCH] 合并 {completed_count} 个PDF的血缘索引...")
         segment_manager.lineage["metadata"]["total_pdfs"] = len(segment_manager.lineage["pdfs"])
         segment_manager.lineage["metadata"]["total_pages"] = len(segment_manager.lineage["pages"])
         segment_manager.lineage["metadata"]["total_lines"] = len(segment_manager.lineage["lines"])
@@ -1343,7 +1538,7 @@ def run_segment_batch(
                     pbar.set_postfix({"文件": pdf_path.name})
                     
                     try:
-                        # 批量模式下不单独保存，最后统一写入
+                        # 不保存lineage（避免每个PDF都读写1.3GB文件），最后统一保存
                         segment_manager.process_pdf(str(pdf_path), save_lineage=False)
                     except Exception as e:
                         print(f"\n[ERROR] 处理失败: {pdf_path.name} - {str(e)}")
@@ -1368,12 +1563,13 @@ def run_segment_batch(
                 except Exception as e:
                     print(f"[ERROR] 处理失败: {pdf_path.name} - {str(e)}")
     
-    # 批量处理结束后统一保存血缘索引
+    # 串行模式：最后统一保存一次lineage（增量合并到磁盘）
     segment_manager.lineage["metadata"]["total_pdfs"] = len(segment_manager.lineage["pdfs"])
     segment_manager.lineage["metadata"]["total_pages"] = len(segment_manager.lineage["pages"])
     segment_manager.lineage["metadata"]["total_lines"] = len(segment_manager.lineage["lines"])
     segment_manager.lineage["metadata"]["total_chars"] = len(segment_manager.lineage["chars"])
     segment_manager._save_lineage(force=True)
+    print(f"[BATCH] 血缘索引已保存")
     
     total_time = time.time() - start_time
     print(f"\n{'='*60}")

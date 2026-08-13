@@ -10,10 +10,10 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from ai_model.models.unet1d import UNet1D, DiceBCELoss
+from ai_model.models.unet1d import UNet1D
 from ai_model.data.dataset import CharSegmentDataset, collate_fn, load_all_line_ids
 from ai_model.train.train_config import FineTuneConfig
-from ai_model.train.train_common import train_model, evaluate_model, save_model_and_history, setup_scheduler
+from ai_model.train.train_common import train_model, evaluate_model, save_model_and_history, setup_scheduler, FocalLoss
 
 
 def load_annotations(config: FineTuneConfig):
@@ -51,18 +51,74 @@ def load_pretrained_model(model: nn.Module, config: FineTuneConfig, device: torc
     model_path = base_dir / config.pretrained_model_path
     
     if model_path.exists():
-        model.load_state_dict(torch.load(str(model_path), map_location=device, weights_only=True))
+        checkpoint = torch.load(str(model_path), map_location=device, weights_only=True)
+        
+        model_state_dict = model.state_dict()
+        checkpoint_keys = set(checkpoint.keys())
+        model_keys = set(model_state_dict.keys())
+        
+        matching_keys = checkpoint_keys & model_keys
+        mismatched_keys = checkpoint_keys - model_keys
+        missing_keys = model_keys - checkpoint_keys
+        
+        if mismatched_keys:
+            print(f"[WARNING] 预训练模型中有但当前模型中没有的参数（可能是输出层差异）: {mismatched_keys}")
+        if missing_keys:
+            print(f"[WARNING] 当前模型中有但预训练模型中没有的参数: {missing_keys}")
+        
+        filtered_checkpoint = {}
+        for key in checkpoint:
+            if key in model_state_dict and checkpoint[key].shape == model_state_dict[key].shape:
+                filtered_checkpoint[key] = checkpoint[key]
+        
+        model.load_state_dict(filtered_checkpoint, strict=False)
+        
         print(f"[INFO] 加载预训练模型: {model_path}")
+        print(f"[INFO] 成功加载 {len(filtered_checkpoint)} 个参数")
+        if len(filtered_checkpoint) < len(checkpoint):
+            print(f"[INFO] 跳过 {len(checkpoint) - len(filtered_checkpoint)} 个不匹配的参数（输出层）")
     else:
         print(f"[WARNING] 预训练模型路径不存在: {model_path}")
         print("[INFO] 将从头开始训练")
 
 
 def freeze_encoder(model: nn.Module):
-    print("[INFO] 冻结编码器层，只训练解码器...")
+    print("[INFO] 冻结编码器层，只训练解码器和输出层...")
     for name, param in model.named_parameters():
-        if 'decoder' not in name.lower():
+        if 'decoder' not in name.lower() and 'outc' not in name.lower():
             param.requires_grad = False
+
+
+def freeze_bn_running_stats(model: nn.Module, freeze_affine: bool = False):
+    """
+    冻结所有 BatchNorm1d 的 running_mean / running_var 更新，防止小样本统计量漂移。
+
+    背景：微调通常使用几十~几百条人工标注数据（远少于预训练数据量），
+    这些样本还可能因主动学习筛选而分布偏斜。BN momentum 每步会把 10%
+    的 batch 统计量融合进 running_stats，经过几十个 epoch 后 BN 统计量
+    几乎完全被小样本"污染"，推理(eval)模式使用漂移后的统计量会直接
+    导致整体分布上的性能退化。
+
+    实现方式：
+      1. 设置 momentum=0 → running_mean / running_var 不再随 batch 更新
+         （比设置 m.eval() 更鲁棒，因为 train_epoch 里会调用 model.train()
+         重新把 BN 切回 train 模式，导致 eval 方式冻结失效）
+      2. 可选冻结 affine 参数（weight/bias）
+    """
+    bn_count = 0
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm1d):
+            m.momentum = 0.0
+            bn_count += 1
+            if freeze_affine:
+                if m.weight is not None:
+                    m.weight.requires_grad = False
+                if m.bias is not None:
+                    m.bias.requires_grad = False
+    if bn_count > 0:
+        print(f"[INFO] 冻结 {bn_count} 个 BatchNorm1d 的 running stats"
+              f"（momentum=0，沿用预训练统计量，防止小样本漂移）"
+              f"{' affine也冻结' if freeze_affine else ''}")
 
 
 def main(config: FineTuneConfig = None):
@@ -88,32 +144,64 @@ def main(config: FineTuneConfig = None):
     print(f"  - 数据集划分文件: {split_path}")
     print(f"  - 预训练模型: {config.pretrained_model_path}")
     print(f"  - 冻结编码器: {config.freeze_layers}")
+    print(f"  - 无验证模式: {config.no_validation}")
     
     train_ids, val_ids, char_width_stats = load_dataset_split(config)
     
-    if train_ids is None:
-        print("[INFO] 加载行ID列表...")
-        if annotations is not None:
-            line_ids = list(annotations.keys())
+    annotation_line_ids = set(annotations.keys()) if annotations is not None else None
+    
+    if annotation_line_ids is not None:
+        print(f"[INFO] 使用标注数据，过滤行ID...")
+        print(f"[INFO] 标注数据包含 {len(annotation_line_ids)} 条记录")
+        
+        if config.no_validation:
+            train_ids = list(annotation_line_ids)
+            val_ids = []
+            print(f"[INFO] 无验证模式: 全部 {len(train_ids)} 条数据用于训练")
         else:
-            line_ids = load_all_line_ids(data_base_path)
-        print(f"[INFO] 找到 {len(line_ids)} 个行图像")
-        
-        if len(line_ids) == 0:
-            print("[ERROR] 未找到训练数据")
-            return
-        
-        np.random.seed(config.seed)
-        np.random.shuffle(line_ids)
-        
-        split_idx = int(len(line_ids) * config.train_ratio)
-        train_ids = line_ids[:split_idx]
-        val_ids = line_ids[split_idx:]
-        
-        print(f"[WARNING] 划分文件不存在，动态生成划分")
-        print(f"[INFO] 使用种子: {config.seed}")
+            if train_ids is not None:
+                train_ids = [lid for lid in train_ids if lid in annotation_line_ids]
+                val_ids = [lid for lid in val_ids if lid in annotation_line_ids]
+                print(f"[INFO] 从划分文件过滤后: 训练集 {len(train_ids)}, 验证集 {len(val_ids)}")
+            
+            if len(train_ids) == 0 or len(val_ids) == 0:
+                print(f"[WARNING] 过滤后样本不足，重新划分标注数据")
+                line_ids = list(annotation_line_ids)
+                np.random.seed(config.seed)
+                np.random.shuffle(line_ids)
+                
+                split_idx = int(len(line_ids) * config.train_ratio)
+                train_ids = line_ids[:split_idx]
+                val_ids = line_ids[split_idx:]
+                char_width_stats = None
     else:
-        print(f"[INFO] 从划分文件加载预计算的字符宽度统计")
+        if train_ids is None:
+            print("[INFO] 加载行ID列表...")
+            line_ids = load_all_line_ids(data_base_path)
+            print(f"[INFO] 找到 {len(line_ids)} 个行图像")
+            
+            if len(line_ids) == 0:
+                print("[ERROR] 未找到训练数据")
+                return
+            
+            if config.no_validation:
+                train_ids = line_ids
+                val_ids = []
+                print(f"[INFO] 无验证模式: 全部 {len(train_ids)} 条数据用于训练")
+            else:
+                np.random.seed(config.seed)
+                np.random.shuffle(line_ids)
+                
+                split_idx = int(len(line_ids) * config.train_ratio)
+                train_ids = line_ids[:split_idx]
+                val_ids = line_ids[split_idx:]
+                
+                print(f"[WARNING] 划分文件不存在，动态生成划分")
+                print(f"[INFO] 使用种子: {config.seed}")
+        else:
+            if config.no_validation:
+                val_ids = []
+            print(f"[INFO] 从划分文件加载预计算的字符宽度统计")
     
     print(f"[INFO] 训练集: {len(train_ids)} 样本")
     print(f"[INFO] 验证集: {len(val_ids)} 样本")
@@ -147,14 +235,18 @@ def main(config: FineTuneConfig = None):
     device_type = "cuda" if "cuda" in str(device) else "cpu"
     print(f"[INFO] 使用设备: {device}")
     
-    model = UNet1D(n_channels=6, n_classes=1).to(device)
+    model = UNet1D(n_channels=6, n_classes=3).to(device)
     
     load_pretrained_model(model, config, device)
     
     if config.freeze_layers:
         freeze_encoder(model)
+
+    # 无论是否冻结编码器，微调时都应冻结 BN running stats
+    # （防止几百条小样本/偏斜样本把预训练统计量"冲掉"）
+    freeze_bn_running_stats(model, freeze_affine=False)
     
-    criterion = DiceBCELoss()
+    criterion = FocalLoss(gamma=2.0)
     
     params_to_train = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.Adam(params_to_train, lr=config.fine_tune_lr)
@@ -188,23 +280,31 @@ def main(config: FineTuneConfig = None):
         model_name=config.model_name,
         lr_scheduler_type=config.lr_scheduler_type,
         global_char_width=global_char_width,
-        mode="微调"
+        mode="微调",
+        no_validation=config.no_validation
     )
     
     print("[INFO] 微调完成")
     
     save_model_and_history(model, history, config.checkpoint_dir, config.model_name, "finetune_history.json")
     
-    print("\n[INFO] 验证集最终评估:")
-    model.load_state_dict(torch.load(str(Path(config.checkpoint_dir) / f"{config.model_name}_best.pth"), weights_only=True))
-    results = evaluate_model(model, val_loader, criterion, device, device_type, config.use_amp, global_char_width)
-    
-    print(f"  损失: {results['loss']:.4f}")
-    print(f"  列级准确率: {results['col_acc']:.4f}")
-    print(f"  区间IoU: {results['iou']:.4f}")
-    print(f"  ROI-IoU: {results['roi_iou']:.4f}")
-    print(f"  Char-IoU: {results['char_iou']:.4f}")
-    print(f"  Gap-IoU: {results['gap_iou']:.4f}")
+    if not config.no_validation:
+        print("\n[INFO] 验证集最终评估:")
+        best_path = Path(config.checkpoint_dir) / f"{config.model_name}_best.pth"
+        if best_path.exists():
+            model.load_state_dict(torch.load(str(best_path), weights_only=True))
+            results = evaluate_model(model, val_loader, criterion, device, device_type, config.use_amp, global_char_width)
+            
+            print(f"  损失: {results['loss']:.4f}")
+            print(f"  列级准确率: {results['col_acc']:.4f}")
+            print(f"  区间IoU: {results['iou']:.4f}")
+            print(f"  ROI-IoU: {results['roi_iou']:.4f}")
+            print(f"  Char-IoU: {results['char_iou']:.4f}")
+            print(f"  Gap-IoU: {results['gap_iou']:.4f}")
+        else:
+            print("[INFO] 无最佳模型文件（无验证模式）")
+    else:
+        print("[INFO] 无验证模式，跳过验证集评估")
 
 
 if __name__ == "__main__":
@@ -219,6 +319,8 @@ if __name__ == "__main__":
     @click.option("--num-workers", type=int, default=4, show_default=True, help="DataLoader 并行数")
     @click.option("--use-amp/--no-amp", default=True, help="是否启用混合精度训练")
     @click.option("--checkpoint-dir", type=str, default="models", show_default=True, help="模型保存目录")
+    @click.option("--model-name", type=str, default=FineTuneConfig.model_name, show_default=True,
+                  help="模型名称前缀，产物会保存为 {model_name}_best.pth / {model_name}_final.pth（默认已带 _finetune）")
     @click.option("--data-base-path", type=str, default="datahome", show_default=True,
                   help="数据基础目录（相对项目根）")
     @click.option("--dataset", "annotations_file", type=str, default=None,
@@ -232,10 +334,12 @@ if __name__ == "__main__":
                   help="是否冻结编码器层，只训练解码器（微调时使用）")
     @click.option("--fine-tune-lr", type=float, default=1e-5, show_default=True,
                   help="微调时使用的学习率")
+    @click.option("--no-validation/--with-validation", default=False,
+                  help="是否使用全部数据训练（无验证集）")
     def cli(batch_size, num_epochs, train_ratio,
-            device, num_workers, use_amp, checkpoint_dir,
+            device, num_workers, use_amp, checkpoint_dir, model_name,
             data_base_path, annotations_file, split_file, seed,
-            pretrained_model_path, freeze_layers, fine_tune_lr):
+            pretrained_model_path, freeze_layers, fine_tune_lr, no_validation):
         cfg = FineTuneConfig(
             batch_size=batch_size,
             num_epochs=num_epochs,
@@ -244,14 +348,18 @@ if __name__ == "__main__":
             num_workers=num_workers,
             use_amp=use_amp,
             checkpoint_dir=checkpoint_dir,
+            model_name=model_name,
             data_base_path=data_base_path,
             annotations_file=annotations_file,
             split_file=split_file,
             seed=seed,
             pretrained_model_path=pretrained_model_path,
             freeze_layers=freeze_layers,
-            fine_tune_lr=fine_tune_lr
+            fine_tune_lr=fine_tune_lr,
+            no_validation=no_validation
         )
+        print(f"[INFO] 输出模型名: {cfg.model_name} → "
+              f"{cfg.model_name}_best.pth / {cfg.model_name}_final.pth")
         main(cfg)
     
     cli()

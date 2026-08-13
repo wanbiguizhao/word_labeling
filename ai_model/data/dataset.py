@@ -89,7 +89,26 @@ class LabelGenerator:
         merge_enabled: bool = True
     ) -> np.ndarray:
         """
-        从字符段生成标签数组
+        从字符段生成3类序列标签数组（支持共享边界）
+        
+        标签定义：
+            0 = 空白区域（字符外部）
+            1 = 边界（字符的起始列和结束列，支持共享边界）
+            2 = 字符内部（非边界的字符区域）
+        
+        特殊情况处理：
+            - 宽度=1的字符：整列标为边界（1）
+            - 宽度=2的字符：两列都标为边界（[1, 1]）
+            - 宽度≥3的字符：首尾列标边界，中间列标内部（[1, 2, ..., 2, 1]）
+        
+        共享边界支持：
+            当两个字符共享边界时（char1.col_end == char2.col_start），
+            该位置被标记为边界(1)，同时属于两个字符的边界，
+            解码器会将其识别为上一个字符的结束和下一个字符的开始。
+        
+        示例：
+            正常字符：[1,2,2,1] → 字符区间(0,3)
+            共享边界：字符A[1,2,1] + 字符B[1,2,1] → 标签[1,2,1,2,1]，区间(0,2), (2,4)
         
         Args:
             char_segments: 字符段列表，每个包含 col_start, col_end, width, height
@@ -99,9 +118,9 @@ class LabelGenerator:
             merge_enabled: 是否启用合并逻辑（与 postprocess_merge_chars 一致）
         
         Returns:
-            label: 二值标签数组，字符区域为1.0，间隙为0.0
+            label: 3类序列标签数组，值为0/1/2
         """
-        label = np.zeros(image_width, dtype=np.float32)
+        label = np.zeros(image_width, dtype=np.int64)
         
         if not char_segments:
             return label
@@ -115,7 +134,7 @@ class LabelGenerator:
             end = max(0, min(end, image_width - 1))
             intervals.append((start, end))
         
-        # 执行合并逻辑
+        # 执行合并逻辑（清洗多切噪声）
         if merge_enabled and len(intervals) >= 2:
             intervals = LabelGenerator._merge_narrow_chars(
                 intervals, image_height,
@@ -126,12 +145,58 @@ class LabelGenerator:
                 max_ratio=MERGE_MAX_ASPECT_RATIO
             )
         
-        # 生成标签
+        # 生成3类序列标签
         for start, end in intervals:
-            if end >= start:
-                label[start:end+1] = 1.0
+            if end < start:
+                continue
+            
+            char_width = end - start + 1
+            
+            if char_width == 1:
+                label[start] = 1
+            elif char_width == 2:
+                label[start] = 1
+                label[end] = 1
+            else:
+                label[start] = 1
+                label[end] = 1
+                if start + 1 <= end - 1:
+                    label[start + 1:end] = 2
         
         return label
+    
+    @staticmethod
+    def visualize_label(label: np.ndarray, save_path: str = None) -> None:
+        """
+        可视化3类序列标签，用于调试检查
+        
+        Args:
+            label: 3类序列标签数组（0=空白, 1=边界, 2=内部）
+            save_path: 保存路径，None则显示（需要matplotlib）
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        
+        cmap = mcolors.ListedColormap(['white', 'red', 'blue'])
+        bounds = [0, 0.5, 1.5, 2.5]
+        norm = mcolors.BoundaryNorm(bounds, cmap.N)
+        
+        fig, ax = plt.subplots(figsize=(10, 2))
+        ax.imshow(label.reshape(1, -1), cmap=cmap, norm=norm, aspect='auto')
+        
+        ax.set_yticks([])
+        ax.set_xlabel('Column')
+        ax.set_title('Sequence Label Visualization (0=white, 1=red, 2=blue)')
+        
+        cbar = plt.colorbar(ax.imshow(label.reshape(1, -1), cmap=cmap, norm=norm, aspect='auto'), 
+                           ax=ax, ticks=[0.25, 1.0, 1.75])
+        cbar.ax.set_yticklabels(['0 (空白)', '1 (边界)', '2 (内部)'])
+        
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight', dpi=150)
+            print(f"标签可视化已保存: {save_path}")
+        else:
+            plt.show()
     
     @staticmethod
     def _merge_narrow_chars(
@@ -337,9 +402,12 @@ class CharSegmentDataset(Dataset):
         
         if self._annotations is not None and line_id in self._annotations:
             image_path_str = self._annotations[line_id].get('image_path', '')
-            line_path = Path(image_path_str)
-            if not line_path.is_absolute():
-                line_path = self.data_base_path.parent / image_path_str.replace('\\', '/')
+            if image_path_str:
+                line_path = Path(image_path_str)
+                if not line_path.is_absolute():
+                    line_path = self.data_base_path.parent / image_path_str.replace('\\', '/')
+            else:
+                line_path = self.lines_dir / f"{line_id}.png"
         else:
             line_path = self.lines_dir / f"{line_id}.png"
         
@@ -366,13 +434,26 @@ class CharSegmentDataset(Dataset):
         if image_height <= 0:
             image_height = img.shape[0]
         image_height = int(image_height * scale)
+
+        # 判断是否需要启用 LabelGenerator 中的碎片合并：
+        #   - 微调模式（GT 人工标注传入 annotations）：绝对不合并，
+        #     因为人工标注的 chars 已经是人工确认的真值，再次合并会把
+        #     刻意分开的标点、省略号点等错误合并，导致标签污染。
+        #   - 预训练模式（rule_json）：如果 rule_json 已经经过 postprocess
+        #     后处理（postprocess_version != 'baseline'），说明碎片合并已在
+        #     规则端执行过，这里不再重复合并，避免双重合并。
+        if self._annotations is not None and line_id in self._annotations:
+            merge_enabled = False
+        else:
+            pp_ver = rule_data.get('postprocess_version', 'baseline')
+            merge_enabled = (pp_ver == 'baseline')
         
         label = LabelGenerator.generate(
             rule_data['chars'], 
             resized_w, 
             image_height,
             scale,
-            merge_enabled=True
+            merge_enabled=merge_enabled
         )
         
         features = features.transpose(1, 0)
@@ -382,7 +463,7 @@ class CharSegmentDataset(Dataset):
         return {
             'line_id': line_id,
             'features': features.astype(np.float32),
-            'label': label.astype(np.float32),
+            'label': label.astype(np.int64),
             'width': resized_w,
             'height': 64,
             'scale': scale,
@@ -397,7 +478,7 @@ def collate_fn(batch):
     # 预分配连续数组，避免多次 np.pad + np.array 的开销
     n_channels = batch[0]['features'].shape[0]
     features_arr = np.zeros((batch_size, n_channels, max_width), dtype=np.float32)
-    labels_arr = np.zeros((batch_size, max_width), dtype=np.float32)
+    labels_arr = np.zeros((batch_size, max_width), dtype=np.int64)
     line_ids = [None] * batch_size
     char_widths = np.zeros(batch_size, dtype=np.float32)
     

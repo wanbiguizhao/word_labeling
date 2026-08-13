@@ -25,16 +25,20 @@ python cli.py predict --help
 cli.py
 ├── segment          # PDF 文本分割流程
 │   ├── single       # 处理单个 PDF 文件
-│   └── batch        # 批量处理 PDF 文件
+│   ├── batch        # 批量处理 PDF 文件
+│   └── reprocess    # 对已有 rule_jsons 重新应用后处理链
 ├── train            # 训练深度学习分割模型
 │   ├── pretrain             # 预训练分割模型（使用 rule_jsons 数据）
 │   ├── finetune             # 微调分割模型（使用合并标注数据）
 │   ├── split-dataset        # 生成数据集划分文件
 │   ├── active-learn         # 主动学习（基于模型）：找出最需标注的行
 │   └── rule-based-al        # 主动学习（基于规则）：仅用规则识别可能切割错误的样本
-└── predict          # 使用模型进行推理
-    ├── line         # 对单行图像进行字符分割
-    └── compare      # 对比规则与模型的切割结果
+├── predict          # 使用模型进行推理
+│   ├── line         # 对单行图像进行字符分割
+│   └── compare      # 对比规则与模型的切割结果
+└── project          # 项目管理
+    ├── infer        # 批量使用模型对项目图片进行推理
+    └── cache-lineage # 生成项目的 lineage_cache.json 缓存
 ```
 
 ---
@@ -92,6 +96,77 @@ python cli.py segment batch --start 0 --end 10 --parallel --max-workers 4
 
 # 指定数据目录
 python cli.py segment batch --data-base-path /path/to/datahome
+```
+
+---
+
+### segment reprocess — 重新应用后处理链
+
+对已有的 `rule_jsons` 重新应用后处理链配置，**不重新读取图像、不重新切割**。从 `segments_type_start_end`（切割原始结果）重建 chars，确保可以反复切换配置不会累积后处理效果。
+
+```bash
+python cli.py segment reprocess [options]
+```
+
+**参数：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--config` | str | None | 后处理链配置名（如 `merge_fragments_gap3`），留空使用 segment_config 默认配置 |
+| `--data-base-path` | path | ./datahome | 数据基础目录 |
+
+**示例：**
+
+```bash
+# 用 merge_fragments_gap3 配置重新处理所有 rule_json
+python cli.py segment reprocess --config merge_fragments_gap3
+
+# 回退到基线（无后处理）
+python cli.py segment reprocess --config baseline
+
+# 用其他配置实验
+python cli.py segment reprocess --config merge_fragments_gap5
+```
+
+**工作流程：**
+
+1. 扫描 `rule_jsons/` 目录下所有 `*_rule.json` 文件
+2. 从 `segments_type_start_end` 重建原始切割 chars
+3. 按配置顺序执行后处理链（合并碎片、过滤脏点等）
+4. 更新 `chars`、`total_chars`、`postprocess_version` 字段并写回
+
+**输出示例：**
+
+```
+[POSTCHAIN] 使用配置: merge_fragments_gap3 (版本: merge_fragments_gap3)
+
+[Reprocess] 共 37649 个 rule_json，配置: merge_fragments_gap3
+  输入目录: D:\projects\work_projects\data_service\datahome\rule_jsons
+  进度: 500/37649
+  ...
+
+[Reprocess] 完成: 处理 37649/37649, 变更 27389, 失败 0
+
+处理: 37649/37649, 变更: 27389, 失败: 0
+```
+
+**后处理链配置文件：**
+
+配置文件位于 `image_tools/postprocess_configs/` 目录下：
+
+| 配置文件 | 说明 |
+|----------|------|
+| `baseline.json` | 无后处理（基线） |
+| `merge_fragments_gap3.json` | 合并窄碎片（width_ratio=0.5, max_gap=3） |
+| `merge_fragments_gap5.json` | 合并窄碎片（width_ratio=0.5, max_gap=5） |
+
+**评估对比：**
+
+切换配置后，可用评估脚本对比效果：
+
+```bash
+# 对比 merge_fragments_gap3 配置在标注数据集上的效果
+python evaluate_rule_merge.py --config merge_fragments_gap3
 ```
 
 ---
@@ -417,6 +492,7 @@ python cli.py predict line <image_path> [options]
 | `--model-path` | path | models/char_segment_1d_unet_best.pth | 模型权重路径 |
 | `--output` | str | — | 可视化结果保存路径（默认不保存） |
 | `--threshold` | float | 0.5 | 字符概率阈值 |
+| `--max-gap` | int | 2 | 合并小间隙的最大像素宽度（设为 -1 禁用合并） |
 
 **示例：**
 
@@ -426,6 +502,9 @@ python cli.py predict line ./datahome/lines/xxx.png --output result.png
 
 # 调整阈值
 python cli.py predict line ./datahome/lines/xxx.png --threshold 0.3
+
+# 禁用间隙合并
+python cli.py predict line ./datahome/lines/xxx.png --max-gap -1
 ```
 
 ---
@@ -446,6 +525,8 @@ python cli.py predict compare <line_id> [options]
 | `--image-path` | path | — | 直接指定行图像路径（替代 data_base_path + line_id） |
 | `--rule-json-path` | path | — | 直接指定规则 JSON 路径 |
 | `--save-dir` | str | ./visualization | 可视化结果保存目录 |
+| `--max-gap` | int | 2 | 模型合并间隙（特征像素，设为 -1 禁用合并） |
+| `--threshold` | float | 0.3 | 模型预测概率阈值（注意：默认 0.3，与 predict line 的 0.5 不同） |
 
 **示例：**
 
@@ -457,6 +538,9 @@ python cli.py predict compare page_pdf_1_line_0 --data-base-path ./datahome
 python cli.py predict compare dummy \
     --image-path ./datahome/lines/xxx.png \
     --rule-json-path ./datahome/rule_jsons/xxx_rule.json
+
+# 调整模型预测阈值
+python cli.py predict compare page_pdf_1_line_0 --threshold 0.5
 ```
 
 生成的对比图包含 4 行：
@@ -504,6 +588,162 @@ python ai_model/inference/infer.py predict ./datahome/lines/xxx.png --output res
 
 # 对比可视化
 python ai_model/inference/visualize_comparison.py compare page_pdf_1_line_0 --data-base-path ./datahome
+```
+
+---
+
+## 4. 项目管理 (project)
+
+### project infer — 批量模型推理
+
+对项目中的所有图片进行批量模型推理，结果保存到项目目录的 `model_jsons` 文件夹中。
+
+```bash
+python cli.py project infer <project_id> [options]
+```
+
+**参数：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `project_id` | str (必填) | — | 项目 ID（如 `proj_20260706_230417`） |
+| `--model-path` | path | models/char_segment_1d_unet_best.pth | 模型权重路径 |
+| `--data-base-path` | path | ./datahome | 数据基础目录 |
+| `--batch-size` | int | 32 | 进度输出间隔（每处理多少条输出一次） |
+| `--threshold` | float | 0.5 | 模型预测概率阈值 |
+
+**示例：**
+
+```bash
+# 使用默认模型批量推理
+python cli.py project infer proj_20260706_230417
+
+# 指定模型路径
+python cli.py project infer proj_20260706_230417 \
+    --model-path ./models/char_segment_1d_unet_best_0629.pth
+
+# 指定数据基础目录
+python cli.py project infer proj_20260706_230417 \
+    --data-base-path /path/to/datahome
+```
+
+**工作流程：**
+
+1. 读取项目的 `line_id_list.json` 获取所有 line_id
+2. 加载指定模型
+3. 遍历每张图片，执行模型推理
+4. 将推理结果保存到 `project/<project_id>/model_jsons/{line_id}_model.json`
+
+**输出格式（每个 `{line_id}_model.json`）：**
+
+```json
+{
+  "line_id": "line_page_pdf_gwyb195510_20_0",
+  "chars": [
+    {"char_id": "line_page_pdf_gwyb195510_20_0_char_0", "line_id": "line_page_pdf_gwyb195510_20_0", "char_idx": 0, "col_start": 10, "col_end": 45, "width": 35},
+    {"char_id": "line_page_pdf_gwyb195510_20_0_char_1", "line_id": "line_page_pdf_gwyb195510_20_0", "char_idx": 1, "col_start": 50, "col_end": 85, "width": 35}
+  ],
+  "char_count": 40,
+  "width": 2015,
+  "height": 46,
+  "threshold": 0.5,
+  "model_path": "char_segment_1d_unet_best.pth"
+}
+```
+
+**输出字段说明：**
+
+| 字段 | 说明 |
+|------|------|
+| `line_id` | 行 ID |
+| `chars` | 字符列表，每个字符包含起始/结束列和宽度 |
+| `char_count` | 字符数量 |
+| `width` | 图像宽度 |
+| `height` | 图像高度 |
+| `threshold` | 使用的概率阈值 |
+| `model_path` | 使用的模型文件名 |
+
+---
+
+### project cache-lineage — 生成规则缓存
+
+基于项目的 `line_id_list.json`，从全局 `lineage.json` 中提取相关数据，生成项目级的 `lineage_cache.json` 文件，用于加速前端页面加载。
+
+```bash
+python cli.py project cache-lineage <project_id> [options]
+```
+
+**参数：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `project_id` | str (必填) | — | 项目 ID |
+| `--data-base-path` | path | ./datahome | 数据基础目录 |
+
+**示例：**
+
+```bash
+python cli.py project cache-lineage proj_20260706_230417
+```
+
+**工作流程：**
+
+1. 读取项目的 `line_id_list.json` 获取所有 line_id
+2. 加载全局 `lineage.json`（可能需要数秒）
+3. 提取项目相关的行数据和字符数据
+4. 生成项目级的 `lineage_cache.json`
+
+**输出示例：**
+
+```
+[INFO] 项目 proj_20260706_230417 包含 1353 条数据
+[INFO] 加载全局 lineage.json（可能需要数秒）...
+[INFO] 全局 lineage.json 包含 37649 行数据
+[INFO] lineage_cache.json 生成完成!
+[INFO] 行数: 1353
+[INFO] 字符数: 45678
+[INFO] 输出文件: ./datahome/project/proj_20260706_230417/lineage_cache.json
+```
+
+**用途：**
+
+生成的 `lineage_cache.json` 会被前端标注系统自动使用，避免每次加载页面时扫描整个 `rule_jsons` 目录，大幅提升页面加载速度（从 16+ 秒降至 < 1 秒）。
+
+---
+
+## 各模块独立调用
+
+每个模块也支持独立调用（无需通过 `cli.py`）：
+
+```bash
+# 数据分割
+python image_tools/segment_manager.py single <pdf_name>
+python image_tools/segment_manager.py batch --start 0 --end 10
+
+# 模型训练（预训练）
+python ai_model/train/pretrain.py --batch-size 64 --epochs 50
+
+# 模型训练（微调）
+python ai_model/train/finetune.py --dataset datahome/datasets/merged_annotations.json \
+    --pretrained-model models/char_segment_1d_unet_best.pth --epochs 30
+
+# 数据集划分
+python ai_model/data/generate_dataset_split.py split-dataset --train-ratio 0.8
+
+# 主动学习
+python ai_model/train/active_learning.py active-learn 100
+
+# 单行推理
+python ai_model/inference/infer.py predict ./datahome/lines/xxx.png --output result.png
+
+# 对比可视化
+python ai_model/inference/visualize_comparison.py compare page_pdf_1_line_0 --data-base-path ./datahome
+
+# 批量推理（通过 cli.py）
+python cli.py project infer proj_20260706_230417
+
+# 生成缓存（通过 cli.py）
+python cli.py project cache-lineage proj_20260706_230417
 ```
 
 ---

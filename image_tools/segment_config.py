@@ -44,6 +44,11 @@ class Line2CharConfig:
     postprocess_min_aspect_ratio: float = 0.5
     postprocess_max_aspect_ratio: float = 1.5
     postprocess_single_aspect_ratio: float = 0.7
+
+    # ===== 后处理链配置（轻量处理链）=====
+    # 指定 postprocess_configs/ 目录下的配置文件名（不含.json后缀）
+    # 设为 None 或 "baseline" 表示不启用处理链
+    postprocess_chain_config: Optional[str] = "baseline"
     
     # ===== 版本管理 =====
     segmentation_version: str = "rule_v1"
